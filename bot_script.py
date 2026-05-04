@@ -1,4 +1,5 @@
 import os
+import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, Bot
@@ -13,7 +14,6 @@ logger = logging.getLogger(__name__)
 persistence = PicklePersistence('bot_data.pkl')
 user_data = {}
 
-# ── Bot handlers ───────────────────────────────────────────────────────────
 def capture_user_data(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     username = update.message.from_user.username
@@ -40,10 +40,10 @@ def show_message_history(update: Update, context: CallbackContext):
 def start(update: Update, context: CallbackContext):
     update.message.reply_text('Hello! I am your monitoring bot. I will capture your messages.')
 
-def send_bulk_dm(bot: Bot, user_ids: list, message: str):
+def send_bulk_dm(bot_instance: Bot, user_ids: list, message: str):
     for user_id in user_ids:
         try:
-            bot.send_message(chat_id=user_id, text=message)
+            bot_instance.send_message(chat_id=user_id, text=message)
             logger.info(f'DM sent to user: {user_id}')
         except Exception as e:
             logger.error(f'Error sending DM to {user_id}: {e}')
@@ -56,7 +56,7 @@ def send_special_dm(update: Update, context: CallbackContext):
 def run_bot():
     bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
     if not bot_token:
-        logger.error('TELEGRAM_BOT_TOKEN not set')
+        logger.error('TELEGRAM_BOT_TOKEN not set — bot not started')
         return
     try:
         updater = Updater(bot_token, persistence=persistence, use_context=True)
@@ -65,28 +65,28 @@ def run_bot():
         dp.add_handler(MessageHandler(Filters.text & ~Filters.command, capture_user_data))
         dp.add_handler(CommandHandler('history', show_message_history))
         dp.add_handler(CommandHandler('send_special_dm', send_special_dm))
-        logger.info('Bot started polling')
         updater.start_polling(drop_pending_updates=True)
-        updater.idle()
+        logger.info('Bot polling started')
+        # Keep thread alive without calling updater.idle()
+        # (idle() uses signal handlers which only work on the main thread)
+        while updater.running:
+            time.sleep(1)
     except Exception as e:
-        logger.error(f'Bot crashed: {e}')
+        logger.error(f'Bot thread crashed: {e}', exc_info=True)
 
-# ── Health check HTTP server — runs in MAIN thread so Render sees PORT bound ──
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b'OK')
-    def log_message(self, format, *args):
+    def log_message(self, fmt, *args):
         pass
 
 if __name__ == '__main__':
-    # Start bot in background thread
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
 
-    # Bind health server in main thread immediately so Render health check passes
     port = int(os.environ.get('PORT', 10000))
-    logger.info(f'Health server binding on port {port}')
+    logger.info(f'Binding health server on port {port}')
     server = HTTPServer(('0.0.0.0', port), HealthHandler)
     server.serve_forever()
