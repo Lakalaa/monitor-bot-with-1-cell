@@ -3,7 +3,7 @@ import time
 import threading
 import logging
 import requests
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from flask import Flask
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -13,10 +13,17 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 API_BASE  = f'https://api.telegram.org/bot{BOT_TOKEN}'
-user_data = {}   # {user_id: {'username': str, 'messages': [str]}}
+user_data = {}
+
+app = Flask(__name__)
 
 
-# ── Telegram helpers ─────────────────────────────────────────────────────────
+@app.route('/')
+def health():
+    return 'OK', 200
+
+
+# ── Telegram helpers ──────────────────────────────────────────────────────────
 
 def tg_post(method, **kwargs):
     try:
@@ -44,7 +51,7 @@ def get_updates(offset=None):
         return []
 
 
-# ── Handlers ─────────────────────────────────────────────────────────────────
+# ── Handlers ──────────────────────────────────────────────────────────────────
 
 def on_start(msg):
     send_message(msg['chat']['id'],
@@ -101,27 +108,19 @@ def run_bot():
     logger.info('Bot polling started')
     offset = None
     while True:
-        updates = get_updates(offset)
-        for upd in updates:
-            offset = upd['update_id'] + 1
-            msg = upd.get('message')
-            if msg:
-                try:
-                    dispatch(msg)
-                except Exception as exc:
-                    logger.error('dispatch error: %s', exc)
-
-
-# ── Health-check server (main thread) ─────────────────────────────────────────
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'OK')
-
-    def log_message(self, *args):
-        pass
+        try:
+            updates = get_updates(offset)
+            for upd in updates:
+                offset = upd['update_id'] + 1
+                msg = upd.get('message')
+                if msg:
+                    try:
+                        dispatch(msg)
+                    except Exception as exc:
+                        logger.error('dispatch error: %s', exc)
+        except BaseException as exc:
+            logger.error('polling loop crashed: %s', exc)
+            time.sleep(5)
 
 
 if __name__ == '__main__':
@@ -129,5 +128,6 @@ if __name__ == '__main__':
     bot_thread.start()
 
     port = int(os.environ.get('PORT', 10000))
-    logger.info('Health server on 0.0.0.0:%d', port)
-    HTTPServer(('0.0.0.0', port), HealthHandler).serve_forever()
+    logger.info('Flask health server on 0.0.0.0:%d', port)
+    # use_reloader=False is critical — reloader forks the process, breaking daemon threads
+    app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
