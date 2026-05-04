@@ -13,21 +13,6 @@ logger = logging.getLogger(__name__)
 persistence = PicklePersistence('bot_data.pkl')
 user_data = {}
 
-# ── Health check HTTP server (required by Render web service) ──────────────
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'OK')
-    def log_message(self, format, *args):
-        pass  # suppress access logs
-
-def start_health_server():
-    port = int(os.environ.get('PORT', 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    logger.info(f'Health server listening on port {port}')
-    server.serve_forever()
-
 # ── Bot handlers ───────────────────────────────────────────────────────────
 def capture_user_data(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
@@ -36,7 +21,6 @@ def capture_user_data(update: Update, context: CallbackContext):
     if user_id not in user_data:
         user_data[user_id] = {'username': username, 'messages': []}
     user_data[user_id]['messages'].append(message_text)
-    persistence.update_user_data(user_data)
     logger.info(f'Captured message from {username}: {message_text}')
     try:
         context.bot.send_message(chat_id=user_id, text=f'Your message was captured: {message_text}')
@@ -69,23 +53,40 @@ def send_special_dm(update: Update, context: CallbackContext):
     send_bulk_dm(update.bot, premium_users, 'You are a premium user! Enjoy your exclusive features.')
     update.message.reply_text('Special message sent to premium users!')
 
-def main():
+def run_bot():
     bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
     if not bot_token:
-        raise ValueError('TELEGRAM_BOT_TOKEN environment variable is not set')
+        logger.error('TELEGRAM_BOT_TOKEN not set')
+        return
+    try:
+        updater = Updater(bot_token, persistence=persistence, use_context=True)
+        dp = updater.dispatcher
+        dp.add_handler(CommandHandler('start', start))
+        dp.add_handler(MessageHandler(Filters.text & ~Filters.command, capture_user_data))
+        dp.add_handler(CommandHandler('history', show_message_history))
+        dp.add_handler(CommandHandler('send_special_dm', send_special_dm))
+        logger.info('Bot started polling')
+        updater.start_polling(drop_pending_updates=True)
+        updater.idle()
+    except Exception as e:
+        logger.error(f'Bot crashed: {e}')
 
-    # Start health check server in background thread
-    t = threading.Thread(target=start_health_server, daemon=True)
-    t.start()
-
-    updater = Updater(bot_token, persistence=persistence, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(CommandHandler('start', start))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, capture_user_data))
-    dp.add_handler(CommandHandler('history', show_message_history))
-    dp.add_handler(CommandHandler('send_special_dm', send_special_dm))
-    updater.start_polling()
-    updater.idle()
+# ── Health check HTTP server — runs in MAIN thread so Render sees PORT bound ──
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK')
+    def log_message(self, format, *args):
+        pass
 
 if __name__ == '__main__':
-    main()
+    # Start bot in background thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    # Bind health server in main thread immediately so Render health check passes
+    port = int(os.environ.get('PORT', 10000))
+    logger.info(f'Health server binding on port {port}')
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    server.serve_forever()
