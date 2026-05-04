@@ -1,4 +1,6 @@
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, Bot
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 from telegram.ext import PicklePersistence
@@ -11,6 +13,22 @@ logger = logging.getLogger(__name__)
 persistence = PicklePersistence('bot_data.pkl')
 user_data = {}
 
+# ── Health check HTTP server (required by Render web service) ──────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK')
+    def log_message(self, format, *args):
+        pass  # suppress access logs
+
+def start_health_server():
+    port = int(os.environ.get('PORT', 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    logger.info(f'Health server listening on port {port}')
+    server.serve_forever()
+
+# ── Bot handlers ───────────────────────────────────────────────────────────
 def capture_user_data(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
     username = update.message.from_user.username
@@ -55,6 +73,11 @@ def main():
     bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
     if not bot_token:
         raise ValueError('TELEGRAM_BOT_TOKEN environment variable is not set')
+
+    # Start health check server in background thread
+    t = threading.Thread(target=start_health_server, daemon=True)
+    t.start()
+
     updater = Updater(bot_token, persistence=persistence, use_context=True)
     dp = updater.dispatcher
     dp.add_handler(CommandHandler('start', start))
