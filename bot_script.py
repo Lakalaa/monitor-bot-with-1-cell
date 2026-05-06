@@ -306,14 +306,15 @@ def cmd_clear(cid):
 
 def cmd_groups(cid):
     if not joined_groups:
-        send(cid, '📭 No groups registered yet. Add me to groups and they will appear here.')
+        send(cid, '📭 No groups found yet.\n\nThe userbot will auto-collect groups as it reads messages in them.')
         return
-    lines = [f'<b>📡 {len(joined_groups)} group(s) the bot is in:</b>\n']
+    lines = [f'<b>📡 {len(joined_groups)} group(s) being monitored:</b>\n']
     for info in sorted(joined_groups.values(), key=lambda x: -x['msg_count']):
+        uname = f'  @{info.get("username")}' if info.get("username") else ''
         lines.append(
-            f"• <b>{info['title']}</b>\n"
-            f"  🆔 <code>{info['chat_id']}</code>\n"
-            f"  📨 {info['msg_count']} msg(s)  |  📅 joined {info['joined_at']}"
+            f"• <b>{info['title']}</b>{uname}\n"
+            f"  🆔 Chat ID: <code>{info['chat_id']}</code>\n"
+            f"  📨 {info['msg_count']} msg(s)  |  📅 {info['joined_at']}"
         )
     send(cid, '\n'.join(lines))
 
@@ -358,6 +359,49 @@ def webhook():
     except Exception as exc:
         error_log.append({'time': _now(), 'error': str(exc)})
         logger.error('webhook error: %s', exc, exc_info=True)
+    return 'OK', 200
+
+@app.route('/ingest/<secret>', methods=['POST'])
+def ingest(secret):
+    """Receive scraped message data from the Telethon userbot."""
+    if secret != SECRET:
+        abort(403)
+    if not request.is_json:
+        abort(400)
+    data = request.get_json(force=True)
+
+    # Register the group
+    cid   = data.get('chat_id')
+    title = data.get('chat_title') or str(cid)
+    chat_user = data.get('chat_username', '')
+    if cid and cid not in joined_groups:
+        joined_groups[cid] = {
+            'title':      title,
+            'chat_id':    cid,
+            'username':   chat_user,
+            'joined_at':  _now(),
+            'msg_count':  0,
+        }
+    if cid in joined_groups:
+        joined_groups[cid]['msg_count'] += 1
+        joined_groups[cid]['title'] = title  # keep fresh
+
+    # Build a fake message dict so existing capture() logic works unchanged
+    fake_msg = {
+        'from': {
+            'id':         data.get('user_id'),
+            'username':   data.get('username', ''),
+            'first_name': data.get('first_name', ''),
+            'is_bot':     False,
+        },
+        'chat': {
+            'id':       cid,
+            'title':    title,
+            'username': chat_user,
+        },
+        'text': data.get('text', ''),
+    }
+    capture(fake_msg)
     return 'OK', 200
 
 @app.route('/set-webhook')
