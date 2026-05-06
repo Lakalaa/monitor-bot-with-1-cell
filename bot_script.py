@@ -1,206 +1,316 @@
-import os
-import json
-import logging
+import os, json, re, logging
 from datetime import datetime
 from collections import deque
 from flask import Flask, request, abort
 import requests
 
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-API_BASE  = f'https://api.telegram.org/bot{BOT_TOKEN}'
-WEBHOOK_URL  = os.environ.get('WEBHOOK_URL', '')
-SECRET       = os.environ.get('WEBHOOK_SECRET', 'monitorbot')
+BOT_TOKEN   = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+API_BASE    = f'https://api.telegram.org/bot{BOT_TOKEN}'
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL', '')
+SECRET      = os.environ.get('WEBHOOK_SECRET', 'monitorbot')
 
-# In-memory store — resets on restart
-# Each entry: {time, username, user_id, project, text}
-message_log = deque(maxlen=500)   # last 500 messages across all groups
-error_log   = deque(maxlen=200)   # runtime errors
-
+# ── Storage (in-memory, maxlen caps RAM usage) ──────────────────────────────
+message_log = deque(maxlen=1000)   # all relevant messages
+alert_log   = deque(maxlen=300)    # high-priority help/error messages
+error_log   = deque(maxlen=100)    # bot runtime errors
 app = Flask(__name__)
 
+# ── Category keyword maps ───────────────────────────────────────────────────
+CATEGORIES = {
+    'error':      ['error', 'failed', 'fail', 'stuck', 'pending', 'rejected',
+                   'reverted', 'revert', 'not working', 'broken', 'can\'t',
+                   'cannot', 'won\'t', 'doesn\'t', 'issue', 'problem',
+                   'help', '0x', 'tx hash', 'txhash', 'hash', 'infinite',
+                   'lost', 'missing', 'wrong', 'invalid', 'unable'],
+    'dao':        ['dao', 'governance', 'proposal', 'vote', 'voting',
+                   'quorum', 'multisig', 'on-chain', 'snapshot', 'delegate'],
+    'staking':    ['stake', 'staking', 'unstake', 'unstaking', 'reward',
+                   'apy', 'apr', 'validator', 'delegat', 'unbond',
+                   'withdraw', 'lock', 'locked', 'vesting'],
+    'trading':    ['swap', 'swapping', 'trade', 'trading', 'slippage',
+                   'price impact', 'liquidity', 'buy', 'sell', 'token',
+                   'fill', 'order', 'position', 'long', 'short'],
+    'migration':  ['migrat', 'migration', 'v1', 'v2', 'v3', 'upgrade',
+                   'old contract', 'new contract', 'convert', 'redeem'],
+    'bridge':     ['bridge', 'bridging', 'cross-chain', 'cross chain',
+                   'layer 2', 'l2', 'arbitrum', 'optimism', 'polygon',
+                   'zksync', 'base', 'bsc', 'transfer'],
+    'dex':        ['dex', 'uniswap', 'pancakeswap', 'sushiswap', 'curve',
+                   'balancer', 'pool', ' lp ', 'liquidity pool', 'amm',
+                   'router', 'pair', 'chart', 'dextools', 'dexscreener'],
+}
 
-# ── Telegram helpers ──────────────────────────────────────────────────────────
+# ── Scam patterns to REJECT ─────────────────────────────────────────────────
+SCAM_PATTERNS = [
+    r'send\s+\d+',
+    r'double\s+your',
+    r'100%\s+profit',
+    r'guaranteed\s+(profit|return|gain)',
+    r'get\s+back\s+\d+x',
+    r'private\s+key',
+    r'seed\s+phrase',
+    r'recovery\s+phrase',
+    r'dm\s+me\s+(now|for|to)',
+    r'click\s+here\s+to\s+claim',
+    r'claim\s+your\s+(free|airdrop)',
+    r'limited\s+time\s+offer',
+    r'investment\s+plan',
+    r'turn\s+.{0,20}\s+into',
+    r'(make|earn)\s+\$\d+.*day',
+    r'(paid|earn).*weekly',
+    r'mining\s+(contract|plan)',
+    r'(recover|reclaim)\s+your\s+(lost|stolen)',
+    r'contact\s+(support|admin)\s+via\s+(dm|telegram)',
+]
+SCAM_RE = [re.compile(p, re.I | re.S) for p in SCAM_PATTERNS]
 
+SCAM_WORDS = {
+    'ponzi', 'scam', 'giveaway', 'airdrop me', 'passive income guarantee',
+    'roi guaranteed', 'connect your wallet to claim', 'admin dm',
+}
+
+def is_scam(text: str) -> bool:
+    t = text.lower()
+    if any(w in t for w in SCAM_WORDS):
+        return True
+    return any(r.search(text) for r in SCAM_RE)
+
+def categorize(text: str) -> list:
+    t = text.lower()
+    matched = [cat for cat, kws in CATEGORIES.items() if any(kw in t for kw in kws)]
+    return matched if matched else ['general']
+
+def is_high_priority(cats: list, text: str) -> bool:
+    priority_cats = {'error', 'bridge', 'migration', 'dao'}
+    if priority_cats & set(cats):
+        return True
+    hp_words = ['help', 'stuck', 'lost', 'failed', 'not working', 'urgent', 'asap']
+    t = text.lower()
+    return any(w in t for w in hp_words)
+
+# ── Telegram helpers ─────────────────────────────────────────────────────────
 def tg(method, **kwargs):
     try:
-        r = requests.post(f'{API_BASE}/{method}', json=kwargs, timeout=10)
+        r = requests.post(f'{API_BASE}/{method}', json=kwargs, timeout=8)
         return r.json()
     except Exception as exc:
         error_log.append({'time': _now(), 'error': str(exc)})
-        logger.error('API %s error: %s', method, exc)
+        logger.error('API %s: %s', method, exc)
         return {}
 
-
 def send(chat_id, text, parse_mode='HTML'):
-    tg('sendMessage', chat_id=chat_id, text=text, parse_mode=parse_mode,
-       disable_web_page_preview=True)
-
+    # Chunk at 4000 chars to stay under Telegram limit
+    for i in range(0, len(text), 4000):
+        tg('sendMessage', chat_id=chat_id, text=text[i:i+4000],
+           parse_mode=parse_mode, disable_web_page_preview=True)
 
 def _now():
-    return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    return datetime.utcnow().strftime('%Y-%m-%d %H:%M')
 
-
-# ── Message capture ───────────────────────────────────────────────────────────
-
+# ── Capture logic ────────────────────────────────────────────────────────────
 def capture(msg):
-    """Silently record every message — no reply to the sender."""
-    user    = msg.get('from', {})
+    user = msg.get('from', {})
+
+    # Skip bots
+    if user.get('is_bot'):
+        return
+
     chat    = msg.get('chat', {})
-    uid     = user.get('id')
-    uname   = user.get('username') or user.get('first_name') or str(uid)
+    text    = msg.get('text') or msg.get('caption') or ''
+
+    # Skip empty non-text messages (photos, stickers, etc. without captions)
+    if not text.strip():
+        return
+
+    # Skip scam messages
+    if is_scam(text):
+        logger.info('SCAM filtered from @%s', user.get('username', '?'))
+        return
+
+    cats    = categorize(text)
+    uname   = user.get('username') or user.get('first_name') or str(user.get('id', '?'))
     project = chat.get('title') or chat.get('username') or str(chat.get('id', ''))
-    text    = msg.get('text') or msg.get('caption') or '[media/sticker]'
+    uid     = user.get('id')
+    priority = is_high_priority(cats, text)
 
     entry = {
-        'time':    _now(),
-        'user_id': uid,
+        'time':     _now(),
+        'user_id':  uid,
         'username': uname,
         'project':  project,
         'text':     text,
+        'cats':     cats,
+        'priority': priority,
     }
     message_log.append(entry)
-    logger.info('Captured [%s] @%s: %s', project, uname, text[:80])
+    if priority:
+        alert_log.append(entry)
 
+    logger.info('[%s] @%s (%s)%s: %s',
+                project, uname, ','.join(cats),
+                ' ⚠️' if priority else '', text[:100])
 
-# ── Command handlers ──────────────────────────────────────────────────────────
+# ── Commands ─────────────────────────────────────────────────────────────────
+def cmd_start(cid):
+    send(cid,
+        '<b>🔍 Crypto Support Monitor</b>\n\n'
+        'I silently monitor all groups I\'m in, filter scams/bots, and log '
+        'real user crypto issues.\n\n'
+        '<b>Commands:</b>\n'
+        '/alerts — ⚠️ high-priority help/error messages\n'
+        '/logs — last 20 real messages\n'
+        '/category [name] — filter by: error, dao, staking, trading, migration, bridge, dex\n'
+        '/users — all users seen + message count\n'
+        '/projects — all groups monitored\n'
+        '/stats — summary counts\n'
+        '/errors — bot runtime errors\n'
+        '/clear — wipe the log')
 
-def cmd_start(chat_id):
-    send(chat_id,
-         '<b>Monitor Bot</b>\n\n'
-         'I silently record all messages in every group I am added to.\n\n'
-         '<b>Commands:</b>\n'
-         '/logs — last 20 messages (username + project + text)\n'
-         '/users — all users seen\n'
-         '/projects — all groups being monitored\n'
-         '/errors — recent errors\n'
-         '/clear — clear the log\n'
-         '/stats — counts summary')
-
-
-def cmd_logs(chat_id):
-    if not message_log:
-        send(chat_id, '📭 No messages captured yet.')
-        return
-    recent = list(message_log)[-20:]
-    lines = ['<b>📋 Last {} messages:</b>'.format(len(recent))]
-    for e in reversed(recent):
+def cmd_alerts(cid):
+    items = list(alert_log)[-20:]
+    if not items:
+        send(cid, '✅ No high-priority alerts yet.'); return
+    lines = [f'<b>⚠️ {len(items)} high-priority alert(s):</b>']
+    for e in reversed(items):
+        cats = ' '.join(f'#{c}' for c in e['cats'])
         lines.append(
-            f"\n🕐 <code>{e['time']}</code>\n"
+            f"\n🕐 <code>{e['time']}</code>  {cats}\n"
             f"👤 @{e['username']}  |  📁 {e['project']}\n"
-            f"💬 {e['text'][:200]}"
-        )
-    send(chat_id, '\n'.join(lines))
+            f"💬 {e['text'][:300]}")
+    send(cid, '\n'.join(lines))
 
+def cmd_logs(cid, filter_cat=None):
+    items = [e for e in message_log if (not filter_cat or filter_cat in e['cats'])]
+    recent = list(items)[-20:]
+    if not recent:
+        send(cid, '📭 No messages captured yet.'); return
+    label = f' #{filter_cat}' if filter_cat else ''
+    lines = [f'<b>📋 Last {len(recent)} messages{label}:</b>']
+    for e in reversed(recent):
+        cats = ' '.join(f'#{c}' for c in e['cats'])
+        flag = ' ⚠️' if e['priority'] else ''
+        lines.append(
+            f"\n🕐 <code>{e['time']}</code>  {cats}{flag}\n"
+            f"👤 @{e['username']}  |  📁 {e['project']}\n"
+            f"💬 {e['text'][:300]}")
+    send(cid, '\n'.join(lines))
 
-def cmd_users(chat_id):
-    if not message_log:
-        send(chat_id, '📭 No users captured yet.')
+def cmd_category(cid, text):
+    parts = text.split(maxsplit=1)
+    cat = parts[1].strip().lower() if len(parts) > 1 else ''
+    valid = list(CATEGORIES.keys()) + ['general']
+    if cat not in valid:
+        send(cid, f'Valid categories: {", ".join(valid)}')
         return
+    cmd_logs(cid, filter_cat=cat)
+
+def cmd_users(cid):
+    if not message_log:
+        send(cid, '📭 No users yet.'); return
     seen = {}
     for e in message_log:
         uid = e['user_id']
         if uid not in seen:
-            seen[uid] = {'username': e['username'], 'count': 0, 'projects': set()}
+            seen[uid] = {'username': e['username'], 'count': 0, 'projects': set(), 'cats': set()}
         seen[uid]['count'] += 1
         seen[uid]['projects'].add(e['project'])
-
-    lines = [f'<b>👥 {len(seen)} unique users seen:</b>']
-    for uid, info in sorted(seen.items(), key=lambda x: -x[1]['count']):
+        seen[uid]['cats'].update(e['cats'])
+    lines = [f'<b>👥 {len(seen)} unique users:</b>']
+    for info in sorted(seen.values(), key=lambda x: -x['count']):
         projs = ', '.join(info['projects'])
-        lines.append(f"• @{info['username']} — {info['count']} msg(s) in: {projs}")
-    send(chat_id, '\n'.join(lines))
+        cats = ' '.join(f'#{c}' for c in info['cats'] if c != 'general')
+        lines.append(f"• @{info['username']} — {info['count']} msg(s)  {cats}\n  📁 {projs}")
+    send(cid, '\n'.join(lines))
 
-
-def cmd_projects(chat_id):
+def cmd_projects(cid):
     if not message_log:
-        send(chat_id, '📭 No groups monitored yet.')
-        return
+        send(cid, '📭 No groups yet.'); return
     groups = {}
     for e in message_log:
         g = e['project']
-        groups[g] = groups.get(g, 0) + 1
+        if g not in groups:
+            groups[g] = {'count': 0, 'cats': set(), 'alerts': 0}
+        groups[g]['count'] += 1
+        groups[g]['cats'].update(e['cats'])
+        if e['priority']:
+            groups[g]['alerts'] += 1
     lines = [f'<b>📁 {len(groups)} group(s) monitored:</b>']
-    for g, cnt in sorted(groups.items(), key=lambda x: -x[1]):
-        lines.append(f"• {g} — {cnt} message(s)")
-    send(chat_id, '\n'.join(lines))
+    for g, info in sorted(groups.items(), key=lambda x: -x[1]['count']):
+        cats = ' '.join(f'#{c}' for c in info['cats'] if c != 'general')
+        alert_str = f'  ⚠️{info["alerts"]}' if info['alerts'] else ''
+        lines.append(f"• <b>{g}</b> — {info['count']} msg(s){alert_str}\n  {cats}")
+    send(cid, '\n'.join(lines))
 
-
-def cmd_errors(chat_id):
-    if not error_log:
-        send(chat_id, '✅ No errors recorded.')
-        return
-    recent = list(error_log)[-10:]
-    lines = [f'<b>⚠️ Last {len(recent)} error(s):</b>']
-    for e in reversed(recent):
-        lines.append(f"\n🕐 <code>{e['time']}</code>\n❌ {e['error']}")
-    send(chat_id, '\n'.join(lines))
-
-
-def cmd_stats(chat_id):
+def cmd_stats(cid):
     total   = len(message_log)
+    alerts  = len(alert_log)
     users   = len({e['user_id'] for e in message_log})
     groups  = len({e['project'] for e in message_log})
-    errors  = len(error_log)
-    send(chat_id,
-         f'<b>📊 Stats:</b>\n'
-         f'Messages captured: <b>{total}</b>\n'
-         f'Unique users: <b>{users}</b>\n'
-         f'Groups monitored: <b>{groups}</b>\n'
-         f'Errors: <b>{errors}</b>')
+    cat_counts = {}
+    for e in message_log:
+        for c in e['cats']:
+            cat_counts[c] = cat_counts.get(c, 0) + 1
+    cat_lines = '\n'.join(f'  #{k}: {v}' for k, v in sorted(cat_counts.items(), key=lambda x: -x[1]))
+    send(cid,
+        f'<b>📊 Monitor Stats:</b>\n'
+        f'Total messages: <b>{total}</b>\n'
+        f'High-priority alerts: <b>{alerts}</b>\n'
+        f'Unique users: <b>{users}</b>\n'
+        f'Groups watched: <b>{groups}</b>\n'
+        f'Runtime errors: <b>{len(error_log)}</b>\n\n'
+        f'<b>By category:</b>\n{cat_lines}')
 
+def cmd_errors_cmd(cid):
+    if not error_log:
+        send(cid, '✅ No runtime errors.'); return
+    items = list(error_log)[-10:]
+    lines = [f'<b>⚠️ Last {len(items)} error(s):</b>']
+    for e in reversed(items):
+        lines.append(f"\n🕐 <code>{e['time']}</code>\n❌ {e['error']}")
+    send(cid, '\n'.join(lines))
 
-def cmd_clear(chat_id):
-    message_log.clear()
-    error_log.clear()
-    send(chat_id, '🗑 Log cleared.')
-
+def cmd_clear(cid):
+    message_log.clear(); alert_log.clear(); error_log.clear()
+    send(cid, '🗑 All logs cleared.')
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
-
 def dispatch(msg):
     chat_id = msg['chat']['id']
-    text    = msg.get('text', '')
+    text    = (msg.get('text') or '').strip()
 
-    # Commands — respond wherever the command was sent
-    if text.startswith('/start'):    cmd_start(chat_id);   return
-    if text.startswith('/logs'):     cmd_logs(chat_id);    return
-    if text.startswith('/users'):    cmd_users(chat_id);   return
-    if text.startswith('/projects'): cmd_projects(chat_id); return
-    if text.startswith('/errors'):   cmd_errors(chat_id);  return
-    if text.startswith('/stats'):    cmd_stats(chat_id);   return
-    if text.startswith('/clear'):    cmd_clear(chat_id);   return
-
-    # Everything else — silently capture, no reply
-    capture(msg)
-
+    if text.startswith('/start'):    cmd_start(chat_id)
+    elif text.startswith('/alerts'): cmd_alerts(chat_id)
+    elif text.startswith('/logs'):   cmd_logs(chat_id)
+    elif text.startswith('/category'): cmd_category(chat_id, text)
+    elif text.startswith('/users'):  cmd_users(chat_id)
+    elif text.startswith('/projects'): cmd_projects(chat_id)
+    elif text.startswith('/stats'):  cmd_stats(chat_id)
+    elif text.startswith('/errors'): cmd_errors_cmd(chat_id)
+    elif text.startswith('/clear'):  cmd_clear(chat_id)
+    else:
+        capture(msg)   # silently log all non-command messages
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
-
 @app.route('/')
 def health():
     return 'OK', 200
-
 
 @app.route(f'/webhook/{SECRET}', methods=['POST'])
 def webhook():
     if not request.is_json:
         abort(400)
     try:
-        update = request.get_json()
+        update = request.get_json(force=True)
         msg = update.get('message') or update.get('channel_post')
         if msg:
             dispatch(msg)
     except Exception as exc:
         error_log.append({'time': _now(), 'error': str(exc)})
-        logger.error('webhook error: %s', exc)
+        logger.error('webhook error: %s', exc, exc_info=True)
     return 'OK', 200
-
 
 @app.route('/set-webhook')
 def set_webhook():
@@ -211,11 +321,10 @@ def set_webhook():
     url = f'{WEBHOOK_URL}/webhook/{SECRET}'
     result = tg('setWebhook', url=url, drop_pending_updates=True,
                 allowed_updates=['message', 'channel_post'])
-    logger.info('setWebhook: %s', result)
+    logger.info('setWebhook → %s', result)
     return json.dumps(result), 200
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
-    logger.info('Starting on 0.0.0.0:%d', port)
+    logger.info('Monitor bot starting on 0.0.0.0:%d', port)
     app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
