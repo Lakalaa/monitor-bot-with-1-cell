@@ -15,7 +15,8 @@ SECRET      = os.environ.get('WEBHOOK_SECRET', 'monitorbot')
 # ── Storage (in-memory, maxlen caps RAM usage) ──────────────────────────────
 message_log = deque(maxlen=1000)   # all relevant messages
 alert_log   = deque(maxlen=300)    # high-priority help/error messages
-error_log   = deque(maxlen=100)    # bot runtime errors
+error_log    = deque(maxlen=100)    # bot runtime errors
+joined_groups = {}   # chat_id → {title, joined_at, msg_count}
 app = Flask(__name__)
 
 # ── Category keyword maps ───────────────────────────────────────────────────
@@ -132,8 +133,19 @@ def capture(msg):
 
     cats    = categorize(text)
     uname   = user.get('username') or user.get('first_name') or str(user.get('id', '?'))
-    project = chat.get('title') or chat.get('username') or str(chat.get('id', ''))
-    uid     = user.get('id')
+    project  = chat.get('title') or chat.get('username') or str(chat.get('id', ''))
+    chat_id_val = chat.get('id')
+    uid      = user.get('id')
+    # Auto-register the group if not yet tracked
+    if chat_id_val and chat_id_val not in joined_groups:
+        joined_groups[chat_id_val] = {
+            'title': project,
+            'chat_id': chat_id_val,
+            'joined_at': _now(),
+            'msg_count': 0,
+        }
+    if chat_id_val and chat_id_val in joined_groups:
+        joined_groups[chat_id_val]['msg_count'] += 1
     priority = is_high_priority(cats, text)
 
     entry = {
@@ -154,6 +166,21 @@ def capture(msg):
                 ' ⚠️' if priority else '', text[:100])
 
 # ── Commands ─────────────────────────────────────────────────────────────────
+def register_group(chat):
+    """Called when the bot is added to a new group/channel."""
+    cid = chat.get('id')
+    if not cid:
+        return
+    title = chat.get('title') or chat.get('username') or str(cid)
+    if cid not in joined_groups:
+        joined_groups[cid] = {
+            'title': title,
+            'chat_id': cid,
+            'joined_at': _now(),
+            'msg_count': 0,
+        }
+        logger.info('Joined new group: %s (%s)', title, cid)
+
 def cmd_start(cid):
     send(cid,
         '<b>🔍 Crypto Support Monitor</b>\n\n'
@@ -166,6 +193,7 @@ def cmd_start(cid):
         '/users — all users seen + message count\n'
         '/projects — all groups monitored\n'
         '/stats — summary counts\n'
+        '/groups — list all groups the bot is in (with chat IDs)\n'
         '/errors — bot runtime errors\n'
         '/clear — wipe the log')
 
@@ -276,6 +304,19 @@ def cmd_clear(cid):
     message_log.clear(); alert_log.clear(); error_log.clear()
     send(cid, '🗑 All logs cleared.')
 
+def cmd_groups(cid):
+    if not joined_groups:
+        send(cid, '📭 No groups registered yet. Add me to groups and they will appear here.')
+        return
+    lines = [f'<b>📡 {len(joined_groups)} group(s) the bot is in:</b>\n']
+    for info in sorted(joined_groups.values(), key=lambda x: -x['msg_count']):
+        lines.append(
+            f"• <b>{info['title']}</b>\n"
+            f"  🆔 <code>{info['chat_id']}</code>\n"
+            f"  📨 {info['msg_count']} msg(s)  |  📅 joined {info['joined_at']}"
+        )
+    send(cid, '\n'.join(lines))
+
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 def dispatch(msg):
     chat_id = msg['chat']['id']
@@ -290,6 +331,7 @@ def dispatch(msg):
     elif text.startswith('/stats'):  cmd_stats(chat_id)
     elif text.startswith('/errors'): cmd_errors_cmd(chat_id)
     elif text.startswith('/clear'):  cmd_clear(chat_id)
+    elif text.startswith('/groups'): cmd_groups(chat_id)
     else:
         capture(msg)   # silently log all non-command messages
 
@@ -307,6 +349,12 @@ def webhook():
         msg = update.get('message') or update.get('channel_post')
         if msg:
             dispatch(msg)
+        # Track when bot is added to a new group
+        member_update = update.get('my_chat_member') or update.get('chat_member')
+        if member_update:
+            new_status = member_update.get('new_chat_member', {}).get('status', '')
+            if new_status in ('member', 'administrator'):
+                register_group(member_update.get('chat', {}))
     except Exception as exc:
         error_log.append({'time': _now(), 'error': str(exc)})
         logger.error('webhook error: %s', exc, exc_info=True)
@@ -320,7 +368,7 @@ def set_webhook():
         return 'WEBHOOK_URL env var not set', 500
     url = f'{WEBHOOK_URL}/webhook/{SECRET}'
     result = tg('setWebhook', url=url, drop_pending_updates=True,
-                allowed_updates=['message', 'channel_post'])
+                allowed_updates=['message', 'channel_post', 'my_chat_member'])
     logger.info('setWebhook → %s', result)
     return json.dumps(result), 200
 
