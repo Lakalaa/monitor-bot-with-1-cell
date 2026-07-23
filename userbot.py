@@ -1,6 +1,13 @@
 import os, asyncio, logging, requests
 from telethon import TelegramClient, events
 from telethon.tl.types import User, Chat, Channel
+from telethon.tl.functions.account import SetPrivacyRequest
+from telethon.tl.types import (
+    InputPrivacyKeyStatusTimestamp,
+    InputPrivacyKeyProfilePhoto,
+    InputPrivacyKeyPhoneNumber,
+    InputPrivacyValueDisallowAll,
+)
 from telethon.sessions import StringSession
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -31,6 +38,29 @@ def push(path: str, payload: dict):
     except Exception as e:
         logger.warning('push failed (%s): %s', path, e)
 
+async def apply_stealth_privacy(client: TelegramClient, session_num: int):
+    """
+    Set all privacy options to Nobody so admins cannot see:
+    - Last seen / online status
+    - Profile photo
+    - Phone number
+    This runs once on startup per session.
+    """
+    rules = [InputPrivacyValueDisallowAll()]
+    privacy_keys = [
+        InputPrivacyKeyStatusTimestamp(),   # Last seen & online
+        InputPrivacyKeyProfilePhoto(),      # Profile photo
+        InputPrivacyKeyPhoneNumber(),       # Phone number
+    ]
+    for key in privacy_keys:
+        try:
+            await client(SetPrivacyRequest(key=key, rules=rules))
+            await asyncio.sleep(1)          # small delay between API calls
+        except Exception as e:
+            logger.warning('Privacy setting failed (session #%d): %s', session_num, e)
+    logger.info('Session #%d — stealth privacy applied (last seen, photo, phone → Nobody)',
+                session_num)
+
 async def run_session(session_num: int, session_str: str):
     if not API_ID or not API_HASH:
         logger.warning('TG_API_ID / TG_API_HASH not set — session #%d skipped', session_num)
@@ -40,33 +70,25 @@ async def run_session(session_num: int, session_str: str):
         StringSession(session_str),
         API_ID,
         API_HASH,
-        # ── Stealth & safety settings ──────────────────────────────────────
-        flood_sleep_threshold=60,   # Auto-sleep instead of crashing on flood-wait
-        request_retries=5,          # Retry failed requests silently
-        connection_retries=-1,      # Reconnect forever (never give up)
-        retry_delay=5,              # Wait 5s between retries
-        auto_reconnect=True,        # Reconnect silently on disconnect
-        receive_updates=True,       # Passive listener — never initiates actions
+        flood_sleep_threshold=60,
+        request_retries=5,
+        connection_retries=-1,
+        retry_delay=5,
+        auto_reconnect=True,
+        receive_updates=True,
     )
 
     known_groups: dict[int, str] = {}
 
     async def register_dialogs():
-        """
-        Scan existing groups on startup.
-        Uses a small random delay between each dialog to look like normal
-        human browsing — avoids flood-wait and rate-limit bans.
-        """
         try:
             async for dialog in client.iter_dialogs():
                 entity = dialog.entity
                 if not isinstance(entity, (Chat, Channel)):
                     continue
-
                 cid   = dialog.id
                 title = getattr(entity, 'title', None) or str(cid)
                 uname = getattr(entity, 'username', None) or ''
-
                 if cid not in known_groups:
                     known_groups[cid] = title
                     push(f'/ingest/{FLASK_SECRET}', {
@@ -76,32 +98,29 @@ async def run_session(session_num: int, session_str: str):
                         'chat_title':    title,
                         'chat_username': uname,
                     })
-
-                # Small delay — looks human, avoids flood-wait
+                # Slow scan — looks human, avoids rate-limits
                 await asyncio.sleep(0.5)
-
         except Exception as e:
             logger.warning('register_dialogs error (session #%d): %s', session_num, e)
 
     @client.on(events.NewMessage)
     async def on_message(event):
         try:
-            # ── Stealth rules ─────────────────────────────────────────────
-            # 1. Never capture messages sent by this account
+            # Never capture messages sent by this account
             if event.out:
                 return
 
-            # 2. Never mark anything as read — keeps "read" receipts silent
-            #    (we simply never call client.send_read_acknowledge or read_history)
+            # Never mark as read — no read receipts ever
+            # (we simply never call read_history or send_read_acknowledge)
 
             chat   = await event.get_chat()
             sender = await event.get_sender()
 
-            # Only monitor groups and channels — ignore private DMs
+            # Groups and channels only — ignore private DMs
             if not isinstance(chat, (Chat, Channel)):
                 return
 
-            # Skip bot messages
+            # Skip bots
             if isinstance(sender, User) and sender.bot:
                 return
 
@@ -113,7 +132,6 @@ async def run_session(session_num: int, session_str: str):
             chat_title = getattr(chat, 'title', None) or str(cid)
             chat_uname = getattr(chat, 'username', None) or ''
 
-            # Detect new group joins in real time
             if cid not in known_groups:
                 known_groups[cid] = chat_title
                 push(f'/ingest/{FLASK_SECRET}', {
@@ -155,17 +173,17 @@ async def run_session(session_num: int, session_str: str):
     me_name = getattr(me, 'username', None) or str(getattr(me, 'id', '?'))
     logger.info('Session #%d connected as @%s', session_num, me_name)
 
+    # Apply stealth privacy settings on every startup
+    await apply_stealth_privacy(client, session_num)
+
     push(f'/ingest/{FLASK_SECRET}', {
         'event_type':  'session_start',
         'session_num': session_num,
         'username':    me_name,
     })
 
-    # Slow startup scan with delays to avoid rate limits
-    logger.info('Session #%d scanning existing groups (slow scan)…', session_num)
     await register_dialogs()
-    logger.info('Session #%d ready — passively watching all groups', session_num)
-
+    logger.info('Session #%d ready — passively watching (stealth mode)', session_num)
     await client.run_until_disconnected()
 
 async def main():
@@ -173,8 +191,7 @@ async def main():
     if not sessions:
         logger.warning('No TG_SESSIONS / TG_SESSION set — userbot disabled')
         return
-    logger.info('Starting %d Telegram session(s) in stealth mode…', len(sessions))
-    # Run each session as a separate independent task
+    logger.info('Starting %d session(s) in stealth mode…', len(sessions))
     await asyncio.gather(*[run_session(n, s) for n, s in sessions])
 
 def start():
