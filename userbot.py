@@ -66,11 +66,18 @@ async def run_session(session_num: int, session_str: str):
     @client.on(events.NewMessage)
     async def on_message(event):
         try:
+            # Skip messages sent BY this account — only watch others
+            if event.out:
+                return
+
             chat   = await event.get_chat()
             sender = await event.get_sender()
 
+            # Only monitor groups and channels, not private DMs
             if not isinstance(chat, (Chat, Channel)):
                 return
+
+            # Skip bot messages
             if isinstance(sender, User) and sender.bot:
                 return
 
