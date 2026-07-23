@@ -1,7 +1,7 @@
-import os, json, re, logging
+import os, json, re, asyncio, logging
 from datetime import datetime
 from collections import deque
-from flask import Flask, request, abort
+from flask import Flask, request, abort, redirect
 import requests
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -11,20 +11,23 @@ BOT_TOKEN      = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 API_BASE       = f'https://api.telegram.org/bot{BOT_TOKEN}'
 WEBHOOK_URL    = os.environ.get('WEBHOOK_URL', '')
 SECRET         = os.environ.get('WEBHOOK_SECRET', 'monitorbot')
-NOTIFY_CHAT_ID = os.environ.get('NOTIFY_CHAT_ID', '')   # owner chat — live alerts go here
+NOTIFY_CHAT_ID = os.environ.get('NOTIFY_CHAT_ID', '')
+RENDER_TOKEN   = os.environ.get('RENDER_API_TOKEN', '')
+SERVICE_ID     = os.environ.get('RENDER_SERVICE_ID', 'srv-d7s3ob8g4nts73d2tdsg')
+TG_API_ID      = int(os.environ.get('TG_API_ID', '0'))
+TG_API_HASH    = os.environ.get('TG_API_HASH', '')
 
-# ── Storage ──────────────────────────────────────────────────────────────────
+# ── Storage ───────────────────────────────────────────────────────────────────
 message_log   = deque(maxlen=1000)
 alert_log     = deque(maxlen=300)
 error_log     = deque(maxlen=100)
-# {chat_id: {title, chat_id, chat_username, session_num, joined_at, msg_count}}
 joined_groups: dict = {}
-# {session_num: username}
-sessions: dict = {}
+sessions: dict      = {}
+pending_auths: dict = {}  # phone → {client, loop, phone_code_hash}
 
 app = Flask(__name__)
 
-# ── Category keywords ────────────────────────────────────────────────────────
+# ── Category keywords ─────────────────────────────────────────────────────────
 CATEGORIES = {
     'error':     ['error', 'failed', 'fail', 'stuck', 'pending', 'rejected',
                   'reverted', 'revert', 'not working', 'broken', "can't",
@@ -86,14 +89,13 @@ def is_high_priority(cats: list, text: str) -> bool:
 def _now():
     return datetime.utcnow().strftime('%Y-%m-%d %H:%M')
 
-# ── Telegram helpers ──────────────────────────────────────────────────────────
+# ── Telegram helpers ───────────────────────────────────────────────────────────
 def tg(method, **kwargs):
     try:
         r = requests.post(f'{API_BASE}/{method}', json=kwargs, timeout=8)
         return r.json()
     except Exception as exc:
         error_log.append({'time': _now(), 'error': str(exc)})
-        logger.error('API %s: %s', method, exc)
         return {}
 
 def send(chat_id, text, parse_mode='HTML'):
@@ -102,99 +104,259 @@ def send(chat_id, text, parse_mode='HTML'):
            parse_mode=parse_mode, disable_web_page_preview=True)
 
 def notify_live(entry: dict):
-    """Immediately push a priority message to the owner's chat."""
     if not NOTIFY_CHAT_ID:
         return
-    cats  = ' '.join(f'#{c}' for c in entry['cats'])
-    num   = entry.get('session_num', '?')
-    grp   = entry['project']
-    gusr  = entry.get('chat_username', '')
+    cats    = ' '.join(f'#{c}' for c in entry['cats'])
+    num     = entry.get('session_num', '?')
+    grp     = entry['project']
+    gusr    = entry.get('chat_username', '')
     grp_str = f'{grp} (@{gusr})' if gusr else grp
-    user  = entry['username']
-    text  = entry['text'][:500]
-    msg = (
-        f'⚠️ <b>[#{num}]</b>  📁 {grp_str}\n'
-        f'👤 @{user}\n'
-        f'💬 {text}\n'
-        f'🏷 {cats}'
-    )
-    tg('sendMessage', chat_id=NOTIFY_CHAT_ID, text=msg,
-       parse_mode='HTML', disable_web_page_preview=True)
+    text    = entry['text'][:500]
+    tg('sendMessage', chat_id=NOTIFY_CHAT_ID, parse_mode='HTML',
+       disable_web_page_preview=True,
+       text=(f'⚠️ <b>[#{num}]</b>  📁 {grp_str}\n'
+             f'👤 @{entry["username"]}\n'
+             f'💬 {text}\n'
+             f'🏷 {cats}'))
 
-def notify_new_group(session_num: int, chat_title: str, chat_username: str, is_new: bool = True):
-    """Alert owner when a number joins a new group."""
+def notify_new_group(session_num, chat_title, chat_username, is_new=True):
     if not NOTIFY_CHAT_ID:
         return
     icon  = '📡' if is_new else '📂'
     label = 'New group joined' if is_new else 'Existing group'
     uname = f' (@{chat_username})' if chat_username else ''
-    tg('sendMessage', chat_id=NOTIFY_CHAT_ID,
-       text=f'{icon} <b>[#{session_num}] {label}:</b> {chat_title}{uname}',
-       parse_mode='HTML', disable_web_page_preview=True)
+    tg('sendMessage', chat_id=NOTIFY_CHAT_ID, parse_mode='HTML',
+       text=f'{icon} <b>[#{session_num}] {label}:</b> {chat_title}{uname}')
 
-def notify_session_start(session_num: int, username: str):
+def notify_session_start(session_num, username):
     if not NOTIFY_CHAT_ID:
         return
-    tg('sendMessage', chat_id=NOTIFY_CHAT_ID,
-       text=f'✅ <b>Session #{session_num}</b> connected as @{username}',
-       parse_mode='HTML', disable_web_page_preview=True)
+    tg('sendMessage', chat_id=NOTIFY_CHAT_ID, parse_mode='HTML',
+       text=f'✅ <b>Session #{session_num}</b> connected as @{username}')
 
-# ── Capture logic ─────────────────────────────────────────────────────────────
+# ── Capture ────────────────────────────────────────────────────────────────────
 def capture(msg: dict, session_num: int = 0):
     user = msg.get('from', {})
     if user.get('is_bot'):
         return
-
-    chat  = msg.get('chat', {})
-    text  = msg.get('text') or msg.get('caption') or ''
-    if not text.strip():
-        return
-    if is_scam(text):
-        logger.info('SCAM filtered from @%s', user.get('username', '?'))
+    chat = msg.get('chat', {})
+    text = msg.get('text') or msg.get('caption') or ''
+    if not text.strip() or is_scam(text):
         return
 
     cats     = categorize(text)
     uname    = user.get('username') or user.get('first_name') or str(user.get('id', '?'))
     project  = chat.get('title') or chat.get('username') or str(chat.get('id', ''))
     cid      = chat.get('id')
-    uid      = user.get('id')
     chat_usr = chat.get('username', '')
 
     if cid and cid not in joined_groups:
         joined_groups[cid] = {
-            'title':        project,
-            'chat_id':      cid,
-            'chat_username': chat_usr,
-            'session_num':  session_num,
-            'joined_at':    _now(),
-            'msg_count':    0,
+            'title': project, 'chat_id': cid,
+            'chat_username': chat_usr, 'session_num': session_num,
+            'joined_at': _now(), 'msg_count': 0,
         }
     if cid and cid in joined_groups:
         joined_groups[cid]['msg_count'] += 1
 
     priority = is_high_priority(cats, text)
     entry = {
-        'time':         _now(),
-        'user_id':      uid,
-        'username':     uname,
-        'project':      project,
-        'chat_username': chat_usr,
-        'session_num':  session_num,
-        'text':         text,
-        'cats':         cats,
-        'priority':     priority,
+        'time': _now(), 'user_id': user.get('id'),
+        'username': uname, 'project': project,
+        'chat_username': chat_usr, 'session_num': session_num,
+        'text': text, 'cats': cats, 'priority': priority,
     }
     message_log.append(entry)
     if priority:
         alert_log.append(entry)
-        notify_live(entry)   # ← instant alert to owner
+        notify_live(entry)
 
-    logger.info('[#%d][%s] @%s (%s)%s: %s',
-                session_num, project, uname, ','.join(cats),
-                ' ⚠️' if priority else '', text[:100])
+# ── Render helpers ─────────────────────────────────────────────────────────────
+def render_get_env() -> list:
+    if not RENDER_TOKEN:
+        return []
+    try:
+        r = requests.get(
+            f'https://api.render.com/v1/services/{SERVICE_ID}/env-vars',
+            headers={'Authorization': f'Bearer {RENDER_TOKEN}'}, timeout=10)
+        return r.json() if r.ok else []
+    except Exception as e:
+        logger.error('render_get_env: %s', e)
+        return []
 
-# ── Commands ──────────────────────────────────────────────────────────────────
-def register_group(chat: dict, session_num: int = 0, is_new: bool = True):
+def render_put_env(env_list: list) -> bool:
+    if not RENDER_TOKEN:
+        return False
+    try:
+        r = requests.put(
+            f'https://api.render.com/v1/services/{SERVICE_ID}/env-vars',
+            headers={'Authorization': f'Bearer {RENDER_TOKEN}',
+                     'Content-Type': 'application/json'},
+            json=env_list, timeout=10)
+        return r.ok
+    except Exception as e:
+        logger.error('render_put_env: %s', e)
+        return False
+
+def render_deploy() -> str:
+    if not RENDER_TOKEN:
+        return ''
+    try:
+        r = requests.post(
+            f'https://api.render.com/v1/services/{SERVICE_ID}/deploys',
+            headers={'Authorization': f'Bearer {RENDER_TOKEN}'}, timeout=10)
+        return r.json().get('id', '') if r.ok else ''
+    except Exception as e:
+        logger.error('render_deploy: %s', e)
+        return ''
+
+def add_session_to_render(new_session: str) -> bool:
+    """Append new_session to TG_SESSIONS on Render, PUT all env-vars, trigger deploy."""
+    env = render_get_env()
+    updated = []
+    found   = False
+    for e in env:
+        ev  = e.get('envVar', {})
+        key = ev.get('key', '')
+        val = ev.get('value', '')
+        if key == 'TG_SESSIONS':
+            val   = f'{val},{new_session}' if val else new_session
+            found = True
+        updated.append({'key': key, 'value': val})
+    if not found:
+        updated.append({'key': 'TG_SESSIONS', 'value': new_session})
+    ok = render_put_env(updated)
+    if ok:
+        render_deploy()
+    return ok
+
+# ── Session generator web UI ───────────────────────────────────────────────────
+CSS = '''<style>
+*{box-sizing:border-box}
+body{font-family:monospace;background:#0d0d0d;color:#00ff88;
+  max-width:520px;margin:60px auto;padding:24px}
+h2{margin:0 0 16px}
+p{color:#aaa;margin:8px 0}
+input{width:100%;padding:12px;margin:10px 0;background:#1a1a1a;
+  color:#00ff88;border:1px solid #00ff88;font-size:15px;border-radius:4px}
+button{width:100%;padding:12px;margin-top:8px;background:#00ff88;
+  color:#000;font-size:15px;font-weight:bold;border:none;
+  border-radius:4px;cursor:pointer}
+button:hover{opacity:.85}
+.box{background:#1a1a1a;border:1px solid #00ff88;padding:14px;
+  word-break:break-all;font-size:12px;border-radius:4px;margin:12px 0}
+.err{color:#ff4444;border-color:#ff4444}
+a{color:#00ff88}
+.note{font-size:12px;color:#666;margin-top:6px}
+</style>'''
+
+@app.route(f'/add/{SECRET}')
+def add_page():
+    api_ok = bool(TG_API_ID and TG_API_HASH)
+    warn   = ('' if api_ok else
+              '<p style="color:#ff4444">⚠️ TG_API_ID / TG_API_HASH not set on Render yet. '
+              'Add them first then redeploy.</p>')
+    return f'''<!DOCTYPE html><html><head><title>Add Phone Number</title>{CSS}</head><body>
+<h2>📱 Add Phone Number</h2>
+{warn}
+<p>Enter the phone number you want to monitor (with country code).<br>
+Telegram will send it a login code.</p>
+<form action="/add/{SECRET}/start" method="post">
+  <input name="phone" placeholder="+1234567890" required {"disabled" if not api_ok else ""}>
+  <button type="submit" {"disabled" if not api_ok else ""}>Send Code →</button>
+</form>
+<p class="note">🔒 This page is private — only accessible via this secret URL.</p>
+</body></html>'''
+
+@app.route(f'/add/{SECRET}/start', methods=['POST'])
+def add_start():
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+
+    phone = request.form.get('phone', '').strip()
+    if not phone:
+        return 'Phone required', 400
+    if not TG_API_ID or not TG_API_HASH:
+        return 'TG_API_ID / TG_API_HASH not set', 500
+
+    # Clean up any existing pending auth for this phone
+    if phone in pending_auths:
+        try:
+            old = pending_auths.pop(phone)
+            old['loop'].run_until_complete(old['client'].disconnect())
+        except Exception:
+            pass
+
+    try:
+        loop   = asyncio.new_event_loop()
+        client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH, loop=loop)
+        loop.run_until_complete(client.connect())
+        result = loop.run_until_complete(client.send_code_request(phone))
+        pending_auths[phone] = {
+            'client': client, 'loop': loop,
+            'phone_code_hash': result.phone_code_hash,
+        }
+        logger.info('Code sent to %s', phone)
+        return f'''<!DOCTYPE html><html><head><title>Enter Code</title>{CSS}</head><body>
+<h2>📨 Code Sent!</h2>
+<p>Telegram sent a code to <b>{phone}</b>.<br>Enter it below:</p>
+<form action="/add/{SECRET}/verify" method="post">
+  <input name="phone" value="{phone}" type="hidden">
+  <input name="code" placeholder="e.g. 12345" required autofocus maxlength="8">
+  <button type="submit">Verify & Add →</button>
+</form>
+<p class="note">⏱ Code expires in ~2 minutes. <a href="/add/{SECRET}">Start over</a></p>
+</body></html>'''
+    except Exception as e:
+        logger.error('add_start error: %s', e)
+        return f'''<!DOCTYPE html><html><head><title>Error</title>{CSS}</head><body>
+<h2>❌ Error</h2><div class="box err">{e}</div>
+<a href="/add/{SECRET}">← Try again</a></body></html>'''
+
+@app.route(f'/add/{SECRET}/verify', methods=['POST'])
+def add_verify():
+    phone = request.form.get('phone', '').strip()
+    code  = request.form.get('code', '').strip()
+
+    if phone not in pending_auths:
+        return redirect(f'/add/{SECRET}')
+
+    auth   = pending_auths[phone]
+    client = auth['client']
+    loop   = auth['loop']
+    pch    = auth['phone_code_hash']
+
+    try:
+        loop.run_until_complete(
+            client.sign_in(phone, code, phone_code_hash=pch))
+        session_str = client.session.save()
+        loop.run_until_complete(client.disconnect())
+        del pending_auths[phone]
+
+        # Auto-add to Render
+        render_ok = add_session_to_render(session_str)
+        render_msg = ('✅ Added to Render automatically — redeploying now.'
+                      if render_ok else
+                      '⚠️ Could not update Render automatically. Copy the string below and add it manually to TG_SESSIONS.')
+
+        logger.info('Session verified for %s — Render update: %s', phone, render_ok)
+        return f'''<!DOCTYPE html><html><head><title>✅ Added</title>{CSS}</head><body>
+<h2>✅ Phone Added!</h2>
+<p>{render_msg}</p>
+<p style="color:#aaa">Session string (keep this safe):</p>
+<div class="box">{session_str}</div>
+<br>
+<a href="/add/{SECRET}">➕ Add another number</a>
+</body></html>'''
+    except Exception as e:
+        logger.error('add_verify error: %s', e)
+        return f'''<!DOCTYPE html><html><head><title>Error</title>{CSS}</head><body>
+<h2>❌ Verification Failed</h2>
+<div class="box err">{e}</div>
+<a href="/add/{SECRET}">← Try again</a></body></html>'''
+
+# ── Bot commands ───────────────────────────────────────────────────────────────
+def register_group(chat, session_num=0, is_new=True):
     cid = chat.get('id')
     if not cid:
         return
@@ -202,24 +364,19 @@ def register_group(chat: dict, session_num: int = 0, is_new: bool = True):
     uname  = chat.get('username', '')
     if cid not in joined_groups:
         joined_groups[cid] = {
-            'title':        title,
-            'chat_id':      cid,
-            'chat_username': uname,
-            'session_num':  session_num,
-            'joined_at':    _now(),
-            'msg_count':    0,
+            'title': title, 'chat_id': cid, 'chat_username': uname,
+            'session_num': session_num, 'joined_at': _now(), 'msg_count': 0,
         }
         notify_new_group(session_num, title, uname, is_new=is_new)
-        logger.info('Group registered [#%d]: %s (%s)', session_num, title, cid)
 
 def cmd_start(cid):
     send(cid,
         '<b>🔍 Multi-Account Crypto Monitor</b>\n\n'
-        'Monitors every group across all added phone numbers. Filters scams and bots.\n\n'
+        'Watches every group across all added phone numbers.\n\n'
         '<b>Commands:</b>\n'
-        '/alerts — ⚠️ live priority alerts\n'
+        '/alerts — ⚠️ priority alerts\n'
         '/logs — last 20 real messages\n'
-        '/category [name] — filter: error, dao, staking, trading, migration, bridge, dex\n'
+        '/category [name] — error/dao/staking/trading/migration/bridge/dex\n'
         '/groups — all groups per number\n'
         '/numbers — connected phone numbers\n'
         '/users — all seen users\n'
@@ -236,32 +393,28 @@ def cmd_alerts(cid):
         cats  = ' '.join(f'#{c}' for c in e['cats'])
         num   = e.get('session_num', '?')
         gusr  = e.get('chat_username', '')
-        grp   = f"{e['project']}{' (@' + gusr + ')' if gusr else ''}"
-        lines.append(
-            f"\n🕐 <code>{e['time']}</code>  {cats}\n"
-            f"<b>[#{num}]</b> 📁 {grp}\n"
-            f"👤 @{e['username']}\n"
-            f"💬 {e['text'][:300]}")
+        grp   = f"{e['project']}{' (@'+gusr+')' if gusr else ''}"
+        lines.append(f"\n🕐 <code>{e['time']}</code>  {cats}\n"
+                     f"<b>[#{num}]</b> 📁 {grp}\n"
+                     f"👤 @{e['username']}\n💬 {e['text'][:300]}")
     send(cid, '\n'.join(lines))
 
 def cmd_logs(cid, filter_cat=None):
-    items = [e for e in message_log if (not filter_cat or filter_cat in e['cats'])]
+    items  = [e for e in message_log if (not filter_cat or filter_cat in e['cats'])]
     recent = list(items)[-20:]
     if not recent:
-        send(cid, '📭 No messages captured yet.'); return
+        send(cid, '📭 No messages yet.'); return
     label = f' #{filter_cat}' if filter_cat else ''
     lines = [f'<b>📋 Last {len(recent)} messages{label}:</b>']
     for e in reversed(recent):
-        cats  = ' '.join(f'#{c}' for c in e['cats'])
-        flag  = ' ⚠️' if e['priority'] else ''
-        num   = e.get('session_num', '?')
-        gusr  = e.get('chat_username', '')
-        grp   = f"{e['project']}{' (@' + gusr + ')' if gusr else ''}"
-        lines.append(
-            f"\n🕐 <code>{e['time']}</code>  {cats}{flag}\n"
-            f"<b>[#{num}]</b> 📁 {grp}\n"
-            f"👤 @{e['username']}\n"
-            f"💬 {e['text'][:300]}")
+        cats = ' '.join(f'#{c}' for c in e['cats'])
+        flag = ' ⚠️' if e['priority'] else ''
+        num  = e.get('session_num', '?')
+        gusr = e.get('chat_username', '')
+        grp  = f"{e['project']}{' (@'+gusr+')' if gusr else ''}"
+        lines.append(f"\n🕐 <code>{e['time']}</code>  {cats}{flag}\n"
+                     f"<b>[#{num}]</b> 📁 {grp}\n"
+                     f"👤 @{e['username']}\n💬 {e['text'][:300]}")
     send(cid, '\n'.join(lines))
 
 def cmd_category(cid, text):
@@ -269,8 +422,7 @@ def cmd_category(cid, text):
     cat   = parts[1].strip().lower() if len(parts) > 1 else ''
     valid = list(CATEGORIES.keys()) + ['general']
     if cat not in valid:
-        send(cid, f'Valid categories: {", ".join(valid)}')
-        return
+        send(cid, f'Valid categories: {", ".join(valid)}'); return
     cmd_logs(cid, filter_cat=cat)
 
 def cmd_groups(cid):
@@ -282,12 +434,12 @@ def cmd_groups(cid):
         by_num.setdefault(n, []).append(g)
     lines = [f'<b>📡 {len(joined_groups)} group(s) across {len(by_num)} number(s):</b>']
     for n in sorted(by_num):
-        grps = sorted(by_num[n], key=lambda x: -x['msg_count'])
-        num_name = sessions.get(n, f'Number {n}')
-        lines.append(f'\n<b>#{n} @{num_name}</b> — {len(grps)} group(s)')
+        grps    = sorted(by_num[n], key=lambda x: -x['msg_count'])
+        name    = sessions.get(n, f'Number {n}')
+        lines.append(f'\n<b>#{n} @{name}</b> — {len(grps)} group(s)')
         for g in grps:
-            uname = f' (@{g["chat_username"]})' if g.get('chat_username') else ''
-            lines.append(f"  • {g['title']}{uname}  📨{g['msg_count']}  🆔<code>{g['chat_id']}</code>")
+            u = f' (@{g["chat_username"]})' if g.get('chat_username') else ''
+            lines.append(f"  • {g['title']}{u}  📨{g['msg_count']}")
     send(cid, '\n'.join(lines))
 
 def cmd_numbers(cid):
@@ -306,7 +458,8 @@ def cmd_users(cid):
     for e in message_log:
         uid = e['user_id']
         if uid not in seen:
-            seen[uid] = {'username': e['username'], 'count': 0, 'projects': set(), 'cats': set()}
+            seen[uid] = {'username': e['username'], 'count': 0,
+                         'projects': set(), 'cats': set()}
         seen[uid]['count'] += 1
         seen[uid]['projects'].add(e['project'])
         seen[uid]['cats'].update(e['cats'])
@@ -318,22 +471,19 @@ def cmd_users(cid):
     send(cid, '\n'.join(lines))
 
 def cmd_stats(cid):
-    total   = len(message_log)
-    alerts  = len(alert_log)
-    users   = len({e['user_id'] for e in message_log})
-    grps    = len(joined_groups)
     cats_c: dict = {}
     for e in message_log:
         for c in e['cats']:
             cats_c[c] = cats_c.get(c, 0) + 1
-    cat_lines = '\n'.join(f'  #{k}: {v}' for k, v in sorted(cats_c.items(), key=lambda x: -x[1]))
+    cat_lines = '\n'.join(f'  #{k}: {v}'
+                          for k, v in sorted(cats_c.items(), key=lambda x: -x[1]))
     send(cid,
         f'<b>📊 Monitor Stats</b>\n'
         f'Sessions active: <b>{len(sessions)}</b>\n'
-        f'Groups tracked: <b>{grps}</b>\n'
-        f'Total messages: <b>{total}</b>\n'
-        f'Priority alerts: <b>{alerts}</b>\n'
-        f'Unique users: <b>{users}</b>\n'
+        f'Groups tracked: <b>{len(joined_groups)}</b>\n'
+        f'Total messages: <b>{len(message_log)}</b>\n'
+        f'Priority alerts: <b>{len(alert_log)}</b>\n'
+        f'Unique users: <b>{len({e["user_id"] for e in message_log})}</b>\n'
         f'Runtime errors: <b>{len(error_log)}</b>\n\n'
         f'<b>By category:</b>\n{cat_lines}')
 
@@ -350,24 +500,23 @@ def cmd_clear(cid):
     message_log.clear(); alert_log.clear(); error_log.clear()
     send(cid, '🗑 Logs cleared.')
 
-# ── Dispatcher ────────────────────────────────────────────────────────────────
 def dispatch(msg):
-    chat_id = msg['chat']['id']
-    text    = (msg.get('text') or '').strip()
-    if   text.startswith('/start'):    cmd_start(chat_id)
-    elif text.startswith('/alerts'):   cmd_alerts(chat_id)
-    elif text.startswith('/logs'):     cmd_logs(chat_id)
-    elif text.startswith('/category'): cmd_category(chat_id, text)
-    elif text.startswith('/groups'):   cmd_groups(chat_id)
-    elif text.startswith('/numbers'):  cmd_numbers(chat_id)
-    elif text.startswith('/users'):    cmd_users(chat_id)
-    elif text.startswith('/stats'):    cmd_stats(chat_id)
-    elif text.startswith('/errors'):   cmd_errors_cmd(chat_id)
-    elif text.startswith('/clear'):    cmd_clear(chat_id)
+    cid  = msg['chat']['id']
+    text = (msg.get('text') or '').strip()
+    if   text.startswith('/start'):    cmd_start(cid)
+    elif text.startswith('/alerts'):   cmd_alerts(cid)
+    elif text.startswith('/logs'):     cmd_logs(cid)
+    elif text.startswith('/category'): cmd_category(cid, text)
+    elif text.startswith('/groups'):   cmd_groups(cid)
+    elif text.startswith('/numbers'):  cmd_numbers(cid)
+    elif text.startswith('/users'):    cmd_users(cid)
+    elif text.startswith('/stats'):    cmd_stats(cid)
+    elif text.startswith('/errors'):   cmd_errors_cmd(cid)
+    elif text.startswith('/clear'):    cmd_clear(cid)
     else:
         capture(msg, session_num=0)
 
-# ── Flask routes ──────────────────────────────────────────────────────────────
+# ── Flask routes ───────────────────────────────────────────────────────────────
 @app.route('/')
 def health():
     return 'OK', 200
@@ -381,92 +530,69 @@ def webhook():
         msg    = update.get('message') or update.get('channel_post')
         if msg:
             dispatch(msg)
-        member_update = update.get('my_chat_member') or update.get('chat_member')
-        if member_update:
-            status = member_update.get('new_chat_member', {}).get('status', '')
-            if status in ('member', 'administrator'):
-                register_group(member_update.get('chat', {}), session_num=0, is_new=True)
+        member = update.get('my_chat_member') or update.get('chat_member')
+        if member:
+            st = member.get('new_chat_member', {}).get('status', '')
+            if st in ('member', 'administrator'):
+                register_group(member.get('chat', {}), is_new=True)
     except Exception as exc:
         error_log.append({'time': _now(), 'error': str(exc)})
-        logger.error('webhook error: %s', exc, exc_info=True)
+        logger.error('webhook: %s', exc, exc_info=True)
     return 'OK', 200
 
 @app.route(f'/ingest/{SECRET}', methods=['POST'])
 def ingest():
     if not request.is_json:
         abort(400)
-    data       = request.get_json(force=True)
-    event_type = data.get('event_type', 'message')
-    snum       = data.get('session_num', 1)
+    data  = request.get_json(force=True)
+    etype = data.get('event_type', 'message')
+    snum  = data.get('session_num', 1)
 
-    if event_type == 'session_start':
+    if etype == 'session_start':
         uname = data.get('username', str(snum))
         sessions[snum] = uname
         notify_session_start(snum, uname)
-        logger.info('Session #%d registered as @%s', snum, uname)
         return 'OK', 200
 
-    if event_type in ('new_group', 'existing_group'):
+    if etype in ('new_group', 'existing_group'):
         cid   = data.get('chat_id')
         title = data.get('chat_title') or str(cid)
         uname = data.get('chat_username', '')
         if cid and cid not in joined_groups:
             joined_groups[cid] = {
-                'title':        title,
-                'chat_id':      cid,
-                'chat_username': uname,
-                'session_num':  snum,
-                'joined_at':    _now(),
-                'msg_count':    0,
+                'title': title, 'chat_id': cid, 'chat_username': uname,
+                'session_num': snum, 'joined_at': _now(), 'msg_count': 0,
             }
-        notify_new_group(snum, title, uname, is_new=(event_type == 'new_group'))
+        notify_new_group(snum, title, uname, is_new=(etype == 'new_group'))
         return 'OK', 200
 
-    # Regular message
+    # Regular message from userbot
     cid      = data.get('chat_id')
     title    = data.get('chat_title') or str(cid)
     chat_usr = data.get('chat_username', '')
-
     if cid and cid not in joined_groups:
         joined_groups[cid] = {
-            'title':        title,
-            'chat_id':      cid,
-            'chat_username': chat_usr,
-            'session_num':  snum,
-            'joined_at':    _now(),
-            'msg_count':    0,
+            'title': title, 'chat_id': cid, 'chat_username': chat_usr,
+            'session_num': snum, 'joined_at': _now(), 'msg_count': 0,
         }
     if cid in joined_groups:
         joined_groups[cid]['msg_count'] += 1
-        joined_groups[cid]['title'] = title
 
-    fake_msg = {
-        'from': {
-            'id':         data.get('user_id'),
-            'username':   data.get('username', ''),
-            'first_name': data.get('first_name', ''),
-            'is_bot':     False,
-        },
-        'chat': {
-            'id':       cid,
-            'title':    title,
-            'username': chat_usr,
-        },
+    capture({
+        'from': {'id': data.get('user_id'), 'username': data.get('username', ''),
+                 'first_name': data.get('first_name', ''), 'is_bot': False},
+        'chat': {'id': cid, 'title': title, 'username': chat_usr},
         'text': data.get('text', ''),
-    }
-    capture(fake_msg, session_num=snum)
+    }, session_num=snum)
     return 'OK', 200
 
 @app.route('/set-webhook')
 def set_webhook():
-    if not BOT_TOKEN:
-        return 'TELEGRAM_BOT_TOKEN not set', 500
-    if not WEBHOOK_URL:
-        return 'WEBHOOK_URL env var not set', 500
+    if not BOT_TOKEN or not WEBHOOK_URL:
+        return 'BOT_TOKEN / WEBHOOK_URL not set', 500
     url    = f'{WEBHOOK_URL}/webhook/{SECRET}'
     result = tg('setWebhook', url=url, drop_pending_updates=True,
                 allowed_updates=['message', 'channel_post', 'my_chat_member'])
-    logger.info('setWebhook → %s', result)
     return json.dumps(result), 200
 
 if __name__ == '__main__':
