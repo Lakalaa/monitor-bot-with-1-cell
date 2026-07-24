@@ -759,6 +759,13 @@ def _start_userbot():
                     return
                 if isinstance(sender, User) and sender.bot:
                     return
+                # Skip admins, moderators, creators — only alert on regular users
+                try:
+                    perms = await client.get_permissions(chat, sender)
+                    if perms and (perms.is_admin or perms.is_creator):
+                        return
+                except Exception:
+                    pass  # Can't check perms — allow through
                 text = (event.message.text or event.message.message or '').strip()
                 if not text:
                     return
@@ -820,6 +827,7 @@ if __name__ == '__main__':
     ub_thread.start()
     logger.info('Userbot background thread started')
     app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
+
 
 
 
