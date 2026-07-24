@@ -117,38 +117,46 @@ def categorize(text: str) -> list:
     matched = [cat for cat, kws in CATEGORIES.items() if any(kw in t for kw in kws)]
     return matched if matched else ['general']
 
+_FIRST_PERSON_RE = re.compile(r"\b(i|my|me|mine|i've|i'm|i'd|i'll|ive|im)\b", re.I)
+
 def is_high_priority(cats: list, text: str) -> bool:
     t = text.lower()
-    # Real user issue signals — broad and context-aware
-    issue_phrases = [
-        # Transaction problems
-        'stuck', 'not confirmed', 'not received', 'didnt receive', "didn't receive",
-        'still pending', 'still waiting', 'hours ago', 'days ago', 'since yesterday',
-        'never arrived', 'disappeared', 'transaction failed', 'tx failed',
-        'swap failed', 'transfer failed', 'not showing', 'not reflected',
-        # Access / account problems
-        'cannot access', 'cant access', "can't access", 'locked out', 'account frozen',
-        'account suspended', 'lost access', 'cant withdraw', "can't withdraw",
-        'withdrawal not', 'withdraw failed', 'unable to', 'wont let me', "won't let me",
-        'not letting me', 'keeps failing', 'keeps saying', 'error when', 'error trying',
-        # Loss / urgency
-        'i lost', 'my funds', 'my tokens', 'my money', 'my balance', 'my coins',
-        'lost my', 'funds missing', 'tokens missing', 'balance wrong', 'balance missing',
-        'wrong amount', 'short amount', 'missing amount',
-        # Generic real help signals (require context — more than one word)
-        'need support', 'need help with', 'please help', 'anyone help',
-        'can someone help', 'does anyone know', 'having issues', 'having problem',
-        'having trouble', 'not working for me', 'broken for me',
-        # Timeframe urgency
-        'since 24', 'since 48', '24 hours', '48 hours', '72 hours',
-        'for days', 'for weeks', 'past few hours',
+
+    # Must contain first-person language — filters out general chat, observations, discussions
+    if not _FIRST_PERSON_RE.search(t):
+        return False
+
+    # What the user personally owns or did (personal subject)
+    personal = [
+        'my transaction', 'my transfer', 'my swap', 'my withdrawal', 'my deposit',
+        'my funds', 'my tokens', 'my balance', 'my wallet', 'my coins', 'my money',
+        'my account', 'my address', 'my order',
+        'i sent', 'i transferred', 'i swapped', 'i deposited', 'i withdrew',
+        "i've sent", "i've been waiting", "i've lost", "i've tried",
+        "i can't", "i cannot", "i couldn't",
+        "i'm getting", "i'm stuck", "i'm unable", "i'm missing",
+        "i didn't receive", "i haven't received", "i haven't gotten",
+        'i lost', 'lost my',
     ]
-    if any(p in t for p in issue_phrases):
-        return True
-    # Category-based high priority
-    if {'error', 'bridge', 'migration', 'dao'} & set(cats):
-        return True
-    return False
+
+    # What went wrong (problem context)
+    problem = [
+        'stuck', 'failed', 'not received', 'not arrived', 'not showing',
+        'not confirmed', 'not credited', 'not reflected', 'not working',
+        'missing', 'disappeared', 'gone', 'lost', 'wrong amount',
+        'still pending', 'still waiting', 'never arrived', 'never showed',
+        'hours ago', 'days ago', 'since yesterday', 'since last',
+        'error', 'rejected', 'reverted', 'invalid',
+        "can't withdraw", 'cant withdraw', 'withdraw failed', 'withdrawal failed',
+        'swap failed', 'transfer failed', 'transaction failed',
+        'not letting', 'wont let', "won't let",
+    ]
+
+    has_personal = any(p in t for p in personal)
+    has_problem  = any(p in t for p in problem)
+
+    # Both required — "my transaction" alone isn't an issue; "failed" alone isn't personal
+    return has_personal and has_problem
 
 def _now():
     return datetime.utcnow().strftime('%Y-%m-%d %H:%M')
