@@ -654,10 +654,146 @@ def set_webhook():
                 allowed_updates=['message', 'channel_post', 'my_chat_member'])
     return json.dumps(result), 200
 
+# ── Embedded userbot (runs in background thread so start.sh is not needed) ────
+def _start_userbot():
+    """Run the Telethon userbot in a background thread with its own event loop."""
+    import asyncio
+    from telethon import TelegramClient, events
+    from telethon.tl.types import User, Chat, Channel
+    from telethon.sessions import StringSession
+    from telethon.tl.functions.account import SetPrivacyRequest
+    from telethon.tl.types import (
+        InputPrivacyKeyStatusTimestamp, InputPrivacyKeyProfilePhoto,
+        InputPrivacyKeyPhoneNumber, InputPrivacyValueDisallowAll,
+    )
+
+    def get_ub_sessions():
+        out = []
+        raw = os.environ.get('TG_SESSIONS', '')
+        for i, s in enumerate(raw.strip().split(','), start=1):
+            s = s.strip()
+            if s:
+                out.append((i, s))
+        return out
+
+    async def apply_stealth(client, num):
+        rules = [InputPrivacyValueDisallowAll()]
+        for key in [InputPrivacyKeyStatusTimestamp(),
+                    InputPrivacyKeyProfilePhoto(),
+                    InputPrivacyKeyPhoneNumber()]:
+            try:
+                await client(SetPrivacyRequest(key=key, rules=rules))
+                await asyncio.sleep(1)
+            except Exception:
+                pass
+        logger.info('UB #%d stealth privacy applied', num)
+
+    async def run_one(num, sess_str):
+        if not TG_API_ID or not TG_API_HASH:
+            logger.warning('UB #%d: TG_API_ID/HASH missing', num)
+            return
+        client = TelegramClient(
+            StringSession(sess_str), TG_API_ID, TG_API_HASH,
+            flood_sleep_threshold=60, request_retries=5,
+            connection_retries=-1, retry_delay=5,
+            auto_reconnect=True, receive_updates=True,
+        )
+        known: dict = {}
+
+        async def scan_dialogs():
+            try:
+                async for dlg in client.iter_dialogs():
+                    ent = dlg.entity
+                    if not isinstance(ent, (Chat, Channel)):
+                        continue
+                    cid   = dlg.id
+                    title = getattr(ent, 'title', None) or str(cid)
+                    uname = getattr(ent, 'username', None) or ''
+                    if cid not in known:
+                        known[cid] = title
+                        joined_groups.setdefault(cid, {
+                            'title': title, 'chat_id': cid,
+                            'chat_username': uname, 'session_num': num,
+                            'joined_at': _now(), 'msg_count': 0,
+                        })
+                        notify_new_group(num, title, uname, is_new=False)
+                        await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.warning('UB #%d scan error: %s', num, e)
+
+        @client.on(events.NewMessage)
+        async def on_msg(event):
+            try:
+                if event.out:
+                    return
+                chat   = await event.get_chat()
+                sender = await event.get_sender()
+                if not isinstance(chat, (Chat, Channel)):
+                    return
+                if isinstance(sender, User) and sender.bot:
+                    return
+                text = (event.message.text or event.message.message or '').strip()
+                if not text:
+                    return
+                cid        = event.chat_id
+                chat_title = getattr(chat, 'title', None) or str(cid)
+                chat_uname = getattr(chat, 'username', None) or ''
+                if cid not in known:
+                    known[cid] = chat_title
+                sender_id  = sender.id if sender else None
+                uname_s    = getattr(sender, 'username', None) or ''
+                first      = getattr(sender, 'first_name', None) or ''
+                last       = getattr(sender, 'last_name', None) or ''
+                display    = uname_s or f'{first} {last}'.strip() or str(sender_id)
+                capture({
+                    'from': {'id': sender_id, 'username': display,
+                             'first_name': first, 'is_bot': False},
+                    'chat': {'id': cid, 'title': chat_title, 'username': chat_uname},
+                    'text': text,
+                }, session_num=num)
+                logger.info('UB #%d [%s] @%s: %s', num, chat_title, display, text[:60])
+            except Exception as e:
+                logger.error('UB #%d on_msg: %s', num, e)
+
+        logger.info('UB #%d connecting…', num)
+        await client.start()
+        me = await client.get_me()
+        me_name = getattr(me, 'username', None) or str(me.id)
+        logger.info('UB #%d connected as @%s', num, me_name)
+        sessions[num] = me_name
+        await apply_stealth(client, num)
+        notify_session_start(num, me_name)
+        await scan_dialogs()
+        logger.info('UB #%d watching in stealth mode', num)
+        await client.run_until_disconnected()
+
+    async def ub_main():
+        ub_sessions = get_ub_sessions()
+        while not ub_sessions:
+            logger.info('UB: no TG_SESSIONS — retrying in 30s')
+            await asyncio.sleep(30)
+            ub_sessions = get_ub_sessions()
+        logger.info('UB: starting %d session(s)', len(ub_sessions))
+        await asyncio.gather(*[run_one(n, s) for n, s in ub_sessions])
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(ub_main())
+    except Exception as e:
+        logger.error('UB thread crashed: %s', e, exc_info=True)
+    finally:
+        loop.close()
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     logger.info('Monitor bot starting on 0.0.0.0:%d', port)
+    # Launch embedded userbot in background thread
+    ub_thread = threading.Thread(target=_start_userbot, daemon=True, name='userbot')
+    ub_thread.start()
+    logger.info('Userbot background thread started')
     app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
+
 
 
 
