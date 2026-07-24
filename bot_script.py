@@ -637,7 +637,7 @@ def ingest():
     if etype == 'session_start':
         uname = data.get('username', str(snum))
         sessions[snum] = uname
-        notify_session_start(snum, uname)
+        # Silent — no notification
         return 'OK', 200
 
     if etype in ('new_group', 'existing_group'):
@@ -649,7 +649,7 @@ def ingest():
                 'title': title, 'chat_id': cid, 'chat_username': uname,
                 'session_num': snum, 'joined_at': _now(), 'msg_count': 0,
             }
-        notify_new_group(snum, title, uname, is_new=(etype == 'new_group'))
+        # Silent — no notification for group discovery
         return 'OK', 200
 
     # Regular message from userbot
@@ -789,7 +789,7 @@ def _start_userbot():
         logger.info('UB #%d connected as @%s', num, me_name)
         sessions[num] = me_name
         await apply_stealth(client, num)
-        notify_session_start(num, me_name)
+        # Silent start — no notification
         await scan_dialogs()
         logger.info('UB #%d watching in stealth mode', num)
         await client.run_until_disconnected()
@@ -820,6 +820,7 @@ if __name__ == '__main__':
     ub_thread.start()
     logger.info('Userbot background thread started')
     app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
+
 
 
 
