@@ -90,10 +90,37 @@ def categorize(text: str) -> list:
     return matched if matched else ['general']
 
 def is_high_priority(cats: list, text: str) -> bool:
+    t = text.lower()
+    # Real user issue signals — broad and context-aware
+    issue_phrases = [
+        # Transaction problems
+        'stuck', 'not confirmed', 'not received', 'didnt receive', "didn't receive",
+        'still pending', 'still waiting', 'hours ago', 'days ago', 'since yesterday',
+        'never arrived', 'disappeared', 'transaction failed', 'tx failed',
+        'swap failed', 'transfer failed', 'not showing', 'not reflected',
+        # Access / account problems
+        'cannot access', 'cant access', "can't access", 'locked out', 'account frozen',
+        'account suspended', 'lost access', 'cant withdraw', "can't withdraw",
+        'withdrawal not', 'withdraw failed', 'unable to', 'wont let me', "won't let me",
+        'not letting me', 'keeps failing', 'keeps saying', 'error when', 'error trying',
+        # Loss / urgency
+        'i lost', 'my funds', 'my tokens', 'my money', 'my balance', 'my coins',
+        'lost my', 'funds missing', 'tokens missing', 'balance wrong', 'balance missing',
+        'wrong amount', 'short amount', 'missing amount',
+        # Generic real help signals (require context — more than one word)
+        'need support', 'need help with', 'please help', 'anyone help',
+        'can someone help', 'does anyone know', 'having issues', 'having problem',
+        'having trouble', 'not working for me', 'broken for me',
+        # Timeframe urgency
+        'since 24', 'since 48', '24 hours', '48 hours', '72 hours',
+        'for days', 'for weeks', 'past few hours',
+    ]
+    if any(p in t for p in issue_phrases):
+        return True
+    # Category-based high priority
     if {'error', 'bridge', 'migration', 'dao'} & set(cats):
         return True
-    hp_words = ['help', 'stuck', 'lost', 'failed', 'not working', 'urgent', 'asap']
-    return any(w in text.lower() for w in hp_words)
+    return False
 
 def _now():
     return datetime.utcnow().strftime('%Y-%m-%d %H:%M')
@@ -115,18 +142,18 @@ def send(chat_id, text, parse_mode='HTML'):
 def notify_live(entry: dict):
     if not NOTIFY_CHAT_ID:
         return
-    cats    = ' '.join(f'#{c}' for c in entry['cats'])
-    num     = entry.get('session_num', '?')
     grp     = entry['project']
     gusr    = entry.get('chat_username', '')
-    grp_str = f'{grp} (@{gusr})' if gusr else grp
-    text    = entry['text'][:500]
+    grp_link = f'<a href="https://t.me/{gusr}">{grp}</a>' if gusr else f'<b>{grp}</b>'
+    uname   = entry['username']
+    user_str = f'@{uname}' if uname else 'Unknown'
+    text    = entry['text'][:600]
     tg('sendMessage', chat_id=NOTIFY_CHAT_ID, parse_mode='HTML',
        disable_web_page_preview=True,
-       text=(f'⚠️ <b>[#{num}]</b>  📁 {grp_str}\n'
-             f'👤 @{entry["username"]}\n'
-             f'💬 {text}\n'
-             f'🏷 {cats}'))
+       text=(f'🚨 <b>USER ISSUE</b>\n'
+             f'📁 {grp_link}\n'
+             f'👤 <b>{user_str}</b>\n\n'
+             f'💬 {text}'))
 
 def notify_new_group(session_num, chat_title, chat_username, is_new=True):
     if not NOTIFY_CHAT_ID:
@@ -711,13 +738,13 @@ def _start_userbot():
                     uname = getattr(ent, 'username', None) or ''
                     if cid not in known:
                         known[cid] = title
+                        # Register silently — no notification for existing groups
                         joined_groups.setdefault(cid, {
                             'title': title, 'chat_id': cid,
                             'chat_username': uname, 'session_num': num,
                             'joined_at': _now(), 'msg_count': 0,
                         })
-                        notify_new_group(num, title, uname, is_new=False)
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(0.2)
             except Exception as e:
                 logger.warning('UB #%d scan error: %s', num, e)
 
@@ -793,6 +820,7 @@ if __name__ == '__main__':
     ub_thread.start()
     logger.info('Userbot background thread started')
     app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
+
 
 
 
