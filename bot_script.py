@@ -313,8 +313,28 @@ def add_start():
 <h2>❌ Error</h2><div class="box err">{e}</div>
 <a href="/add/{SECRET}">← Try again</a></body></html>'''
 
+def _finish_session(phone: str, client, loop) -> str:
+    """Save session, add to Render, return rendered HTML."""
+    session_str = client.session.save()
+    loop.run_until_complete(client.disconnect())
+    del pending_auths[phone]
+    render_ok  = add_session_to_render(session_str)
+    render_msg = ('✅ Added to Render automatically — redeploying now.'
+                  if render_ok else
+                  '⚠️ Could not update Render. Copy the string below and add manually to TG_SESSIONS.')
+    logger.info('Session saved for %s — Render: %s', phone, render_ok)
+    return f'''<!DOCTYPE html><html><head><title>✅ Added</title>{CSS}</head><body>
+<h2>✅ Phone Added!</h2>
+<p>{render_msg}</p>
+<p style="color:#aaa">Session string (keep this safe):</p>
+<div class="box">{session_str}</div>
+<br>
+<a href="/add/{SECRET}">➕ Add another number</a>
+</body></html>'''
+
 @app.route(f'/add/{SECRET}/verify', methods=['POST'])
 def add_verify():
+    from telethon.errors import SessionPasswordNeededError
     phone = request.form.get('phone', '').strip()
     code  = request.form.get('code', '').strip()
 
@@ -327,31 +347,47 @@ def add_verify():
     pch    = auth['phone_code_hash']
 
     try:
-        loop.run_until_complete(
-            client.sign_in(phone, code, phone_code_hash=pch))
-        session_str = client.session.save()
-        loop.run_until_complete(client.disconnect())
-        del pending_auths[phone]
-
-        # Auto-add to Render
-        render_ok = add_session_to_render(session_str)
-        render_msg = ('✅ Added to Render automatically — redeploying now.'
-                      if render_ok else
-                      '⚠️ Could not update Render automatically. Copy the string below and add it manually to TG_SESSIONS.')
-
-        logger.info('Session verified for %s — Render update: %s', phone, render_ok)
-        return f'''<!DOCTYPE html><html><head><title>✅ Added</title>{CSS}</head><body>
-<h2>✅ Phone Added!</h2>
-<p>{render_msg}</p>
-<p style="color:#aaa">Session string (keep this safe):</p>
-<div class="box">{session_str}</div>
-<br>
-<a href="/add/{SECRET}">➕ Add another number</a>
+        loop.run_until_complete(client.sign_in(phone, code, phone_code_hash=pch))
+        return _finish_session(phone, client, loop)
+    except SessionPasswordNeededError:
+        # Account has 2FA — show password form
+        pending_auths[phone]['awaiting_2fa'] = True
+        return f'''<!DOCTYPE html><html><head><title>2FA Required</title>{CSS}</head><body>
+<h2>🔐 2FA Password Required</h2>
+<p>This account has two-step verification enabled.<br>Enter your Telegram 2FA password:</p>
+<form action="/add/{SECRET}/password" method="post">
+  <input name="phone" value="{phone}" type="hidden">
+  <input name="password" type="password" placeholder="Your 2FA password" required autofocus>
+  <button type="submit">Confirm →</button>
+</form>
+<p class="note"><a href="/add/{SECRET}">← Start over</a></p>
 </body></html>'''
     except Exception as e:
         logger.error('add_verify error: %s', e)
         return f'''<!DOCTYPE html><html><head><title>Error</title>{CSS}</head><body>
 <h2>❌ Verification Failed</h2>
+<div class="box err">{e}</div>
+<a href="/add/{SECRET}">← Try again</a></body></html>'''
+
+@app.route(f'/add/{SECRET}/password', methods=['POST'])
+def add_password():
+    phone    = request.form.get('phone', '').strip()
+    password = request.form.get('password', '').strip()
+
+    if phone not in pending_auths:
+        return redirect(f'/add/{SECRET}')
+
+    auth   = pending_auths[phone]
+    client = auth['client']
+    loop   = auth['loop']
+
+    try:
+        loop.run_until_complete(client.sign_in(password=password))
+        return _finish_session(phone, client, loop)
+    except Exception as e:
+        logger.error('add_password error: %s', e)
+        return f'''<!DOCTYPE html><html><head><title>Error</title>{CSS}</head><body>
+<h2>❌ Password Failed</h2>
 <div class="box err">{e}</div>
 <a href="/add/{SECRET}">← Try again</a></body></html>'''
 
@@ -599,3 +635,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     logger.info('Monitor bot starting on 0.0.0.0:%d', port)
     app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
+
