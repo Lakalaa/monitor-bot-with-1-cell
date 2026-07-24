@@ -24,6 +24,7 @@ error_log     = deque(maxlen=100)
 joined_groups: dict = {}
 sessions: dict      = {}
 pending_auths: dict = {}  # phone → {client, phone_code_hash, code?}
+_seen_msgs    = deque(maxlen=5000)  # dedup: (chat_id, msg_id)
 
 # Single background event loop — all Telethon ops run here, no threading issues
 _bg_loop = asyncio.new_event_loop()
@@ -62,20 +63,47 @@ CATEGORIES = {
 }
 
 SCAM_PATTERNS = [
-    r'send\s+\d+', r'double\s+your', r'100%\s+profit',
-    r'guaranteed\s+(profit|return|gain)', r'get\s+back\s+\d+x',
-    r'private\s+key', r'seed\s+phrase', r'recovery\s+phrase',
-    r'dm\s+me\s+(now|for|to)', r'click\s+here\s+to\s+claim',
-    r'claim\s+your\s+(free|airdrop)', r'limited\s+time\s+offer',
-    r'investment\s+plan', r'turn\s+.{0,20}\s+into',
-    r'(make|earn)\s+\$\d+.*day', r'(paid|earn).*weekly',
-    r'mining\s+(contract|plan)', r'(recover|reclaim)\s+your\s+(lost|stolen)',
-    r'contact\s+(support|admin)\s+via\s+(dm|telegram)',
+    # Money promises
+    r'send\s+\d+', r'double\s+your', r'100%\s+profit', r'\d+x\s+(profit|return|gain)',
+    r'guaranteed\s+(profit|return|gain|roi)', r'get\s+back\s+\d+x',
+    r'(make|earn)\s+\$?\d+.*?(day|week|month)', r'(paid|earn).*weekly',
+    r'turn\s+.{0,30}into', r'investment\s+plan', r'managed\s+(account|fund)',
+    r'copy\s*trad(e|ing)', r'signal(s)?\s+(group|service|provider)',
+    r'profit\s+sharing', r'\d{2,}%\s+(daily|weekly|monthly)',
+    # Credentials theft
+    r'private\s+key', r'seed\s+phrase', r'recovery\s+phrase', r'secret\s+phrase',
+    r'mnemonic', r'wallet\s+passphrase',
+    # Recovery scams
+    r'(recover|reclaim|retrieve|get\s+back)\s+(your\s+)?(lost|stolen|missing)\s+(fund|token|coin|crypto|money)',
+    r'recovery\s+(expert|specialist|service)', r'funds?\s+recovery',
+    r'help\s+you\s+recover', r'i\s+(can|will)\s+(help|recover|retrieve)',
+    r'(helped|recovered)\s+.{0,30}(fund|token|crypto)',
+    # Unsolicited contact / DM pushing
+    r'dm\s+me', r'message\s+me', r'chat\s+me', r'inbox\s+me',
+    r'reach\s+(out|me)', r'contact\s+me', r'add\s+me',
+    r'text\s+me\s+(now|for|to|via)', r'whatsapp\s+me',
+    r'contact\s+(support|admin)\s+via\s+(dm|telegram|whatsapp)',
+    r'my\s+(telegram|whatsapp|instagram|twitter)\s+is\s+@?\w+',
+    r'@\w+\s+(can\s+help|helped\s+me|recovered)',
+    # Fake claims
+    r'click\s+here\s+to\s+(claim|connect|verify)',
+    r'claim\s+your\s+(free|airdrop|reward|bonus)',
+    r'limited\s+time\s+(offer|deal)', r'exclusive\s+(offer|deal|access)',
+    r'mining\s+(contract|plan|pool|rig)', r'presale\s+(access|slot|whitelist)',
+    r'whitelist\s+(spot|access|free)', r'free\s+(tokens?|nft|crypto|airdrop)',
+    r'connect\s+your\s+wallet\s+to', r'verify\s+your\s+wallet',
+    # Promotions / shilling
+    r'(buy|invest)\s+(now|today|fast|quick)', r'don\'t\s+miss\s+(out|this)',
+    r'gem\s+(alert|found|discover)', r'next\s+\d+x', r'moon\s+soon',
+    r'100x\s+potential', r'early\s+(investor|access|bird)',
 ]
 SCAM_RE = [re.compile(p, re.I | re.S) for p in SCAM_PATTERNS]
 SCAM_WORDS = {
-    'ponzi', 'scam', 'giveaway', 'airdrop me', 'passive income guarantee',
-    'roi guaranteed', 'connect your wallet to claim', 'admin dm',
+    'ponzi', 'giveaway', 'passive income guarantee', 'roi guaranteed',
+    'connect your wallet to claim', 'admin dm', 'pump incoming',
+    'presale open', 'whitelist open', 'copy trade', 'managed account',
+    'investment opportunity', 'get rich', 'financial freedom guaranteed',
+    'i can help you recover', 'dm for help', 'message me for help',
 }
 
 def is_scam(text: str) -> bool:
@@ -171,13 +199,23 @@ def notify_session_start(session_num, username):
        text=f'✅ <b>Session #{session_num}</b> connected as @{username}')
 
 # ── Capture ────────────────────────────────────────────────────────────────────
-def capture(msg: dict, session_num: int = 0):
+def capture(msg: dict, session_num: int = 0, msg_id: int = None):
     user = msg.get('from', {})
-    if user.get('is_bot'):
+    # Block bots and anonymous/channel senders
+    if not user or user.get('is_bot') or not user.get('id'):
         return
     chat = msg.get('chat', {})
     text = msg.get('text') or msg.get('caption') or ''
-    if not text.strip() or is_scam(text):
+    if not text.strip():
+        return
+    # Dedup — same (chat_id, msg_id) or same (chat_id, text) within recent window
+    cid = chat.get('id')
+    dedup_key = (cid, msg_id) if msg_id else (cid, hash(text[:200]))
+    if dedup_key in _seen_msgs:
+        return
+    _seen_msgs.append(dedup_key)
+    # Scam filter
+    if is_scam(text):
         return
 
     cats     = categorize(text)
@@ -757,7 +795,8 @@ def _start_userbot():
                 sender = await event.get_sender()
                 if not isinstance(chat, (Chat, Channel)):
                     return
-                if isinstance(sender, User) and sender.bot:
+                # Block bots, channel posts (sender=None), and non-user senders
+                if sender is None or not isinstance(sender, User) or sender.bot:
                     return
                 # Skip admins, moderators, creators — only alert on regular users
                 try:
@@ -770,21 +809,21 @@ def _start_userbot():
                 if not text:
                     return
                 cid        = event.chat_id
+                msg_id     = event.message.id
                 chat_title = getattr(chat, 'title', None) or str(cid)
                 chat_uname = getattr(chat, 'username', None) or ''
                 if cid not in known:
                     known[cid] = chat_title
-                sender_id  = sender.id if sender else None
-                uname_s    = getattr(sender, 'username', None) or ''
-                first      = getattr(sender, 'first_name', None) or ''
-                last       = getattr(sender, 'last_name', None) or ''
-                display    = uname_s or f'{first} {last}'.strip() or str(sender_id)
+                uname_s = getattr(sender, 'username', None) or ''
+                first   = getattr(sender, 'first_name', None) or ''
+                last    = getattr(sender, 'last_name', None) or ''
+                display = uname_s or f'{first} {last}'.strip() or str(sender.id)
                 capture({
-                    'from': {'id': sender_id, 'username': display,
+                    'from': {'id': sender.id, 'username': display,
                              'first_name': first, 'is_bot': False},
                     'chat': {'id': cid, 'title': chat_title, 'username': chat_uname},
                     'text': text,
-                }, session_num=num)
+                }, session_num=num, msg_id=msg_id)
                 logger.info('UB #%d [%s] @%s: %s', num, chat_title, display, text[:60])
             except Exception as e:
                 logger.error('UB #%d on_msg: %s', num, e)
