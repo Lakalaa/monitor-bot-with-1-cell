@@ -1,4 +1,4 @@
-import os, json, re, asyncio, logging
+import os, json, re, asyncio, logging, threading
 from datetime import datetime
 from collections import deque
 from flask import Flask, request, abort, redirect
@@ -23,7 +23,16 @@ alert_log     = deque(maxlen=300)
 error_log     = deque(maxlen=100)
 joined_groups: dict = {}
 sessions: dict      = {}
-pending_auths: dict = {}  # phone → {client, loop, phone_code_hash}
+pending_auths: dict = {}  # phone → {client, phone_code_hash, code?}
+
+# Single background event loop — all Telethon ops run here, no threading issues
+_bg_loop = asyncio.new_event_loop()
+threading.Thread(target=_bg_loop.run_forever, daemon=True, name='tg-auth-loop').start()
+
+def run_async(coro, timeout=60):
+    """Submit a coroutine to the background loop and block until done."""
+    future = asyncio.run_coroutine_threadsafe(coro, _bg_loop)
+    return future.result(timeout=timeout)
 
 app = Flask(__name__)
 
@@ -282,18 +291,18 @@ def add_start():
     # Clean up any existing pending auth for this phone
     if phone in pending_auths:
         try:
-            old = pending_auths.pop(phone)
-            old['loop'].run_until_complete(old['client'].disconnect())
+            old_client = pending_auths.pop(phone)['client']
+            run_async(old_client.disconnect())
         except Exception:
             pass
 
     try:
-        loop   = asyncio.new_event_loop()
-        client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH, loop=loop)
-        loop.run_until_complete(client.connect())
-        result = loop.run_until_complete(client.send_code_request(phone))
+        client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH,
+                                loop=_bg_loop)
+        run_async(client.connect())
+        result = run_async(client.send_code_request(phone))
         pending_auths[phone] = {
-            'client': client, 'loop': loop,
+            'client': client,
             'phone_code_hash': result.phone_code_hash,
         }
         logger.info('Code sent to %s', phone)
@@ -315,53 +324,24 @@ def add_start():
 
 @app.route(f'/add/{SECRET}/verify', methods=['POST'])
 def add_verify():
-    from telethon import TelegramClient as _TGC
-    from telethon.sessions import StringSession as _SS
     from telethon.errors import SessionPasswordNeededError
 
-    phone    = request.form.get('phone', '').strip()
-    code     = request.form.get('code', '').strip()
-    password = request.form.get('password', '').strip()  # set on 2FA retry
+    phone = request.form.get('phone', '').strip()
+    code  = request.form.get('code', '').strip()
 
     if phone not in pending_auths:
         return redirect(f'/add/{SECRET}')
 
-    auth = pending_auths[phone]
-    pch  = auth['phone_code_hash']
-
-    # Persist code so the 2FA retry can reuse it
-    if code:
-        pending_auths[phone]['code'] = code
-    else:
-        code = auth.get('code', '')
-
-    # Always use a FRESH loop + client — avoids Flask thread / event-loop mismatch
-    fresh_loop   = asyncio.new_event_loop()
-    asyncio.set_event_loop(fresh_loop)
-    fresh_client = _TGC(_SS(), TG_API_ID, TG_API_HASH, loop=fresh_loop)
+    auth   = pending_auths[phone]
+    client = auth['client']
+    pch    = auth['phone_code_hash']
 
     try:
-        async def _do_auth():
-            await fresh_client.connect()
-            try:
-                await fresh_client.sign_in(phone, code, phone_code_hash=pch)
-            except SessionPasswordNeededError:
-                if password:
-                    await fresh_client.sign_in(password=password)
-                else:
-                    raise   # bubble up so we can show the 2FA form
-
-        fresh_loop.run_until_complete(_do_auth())
-
-        session_str = fresh_client.session.save()
-        try:
-            fresh_loop.run_until_complete(fresh_client.disconnect())
-        except Exception:
-            pass
-        fresh_loop.close()
-
-        if phone in pending_auths:
-            del pending_auths[phone]
+        run_async(client.sign_in(phone, code, phone_code_hash=pch))
+        # Success — no 2FA
+        session_str = client.session.save()
+        run_async(client.disconnect())
+        del pending_auths[phone]
 
         render_ok  = add_session_to_render(session_str)
         render_msg = ('✅ Added to Render automatically — redeploying now.'
@@ -377,18 +357,13 @@ def add_verify():
 </body></html>'''
 
     except SessionPasswordNeededError:
-        try:
-            fresh_loop.run_until_complete(fresh_client.disconnect())
-        except Exception:
-            pass
-        fresh_loop.close()
-        # Show 2FA form — posts back here with code hidden + password
+        # Account has 2FA — keep client alive, show password form
+        logger.info('2FA required for %s', phone)
         return f'''<!DOCTYPE html><html><head><title>2FA Required</title>{CSS}</head><body>
 <h2>🔐 2FA Password Required</h2>
 <p>This account has two-step verification.<br>Enter your Telegram 2FA password:</p>
-<form action="/add/{SECRET}/verify" method="post">
+<form action="/add/{SECRET}/password" method="post">
   <input name="phone" value="{phone}" type="hidden">
-  <input name="code"  value="{code}"  type="hidden">
   <input name="password" type="password" placeholder="Your 2FA password" required autofocus>
   <button type="submit">Confirm →</button>
 </form>
@@ -396,17 +371,46 @@ def add_verify():
 </body></html>'''
 
     except Exception as e:
-        try:
-            fresh_loop.run_until_complete(fresh_client.disconnect())
-        except Exception:
-            pass
-        try:
-            fresh_loop.close()
-        except Exception:
-            pass
         logger.error('add_verify error: %s', e)
         return f'''<!DOCTYPE html><html><head><title>Error</title>{CSS}</head><body>
 <h2>❌ Verification Failed</h2>
+<div class="box err">{e}</div>
+<a href="/add/{SECRET}">← Try again</a></body></html>'''
+
+@app.route(f'/add/{SECRET}/password', methods=['POST'])
+def add_password():
+    phone    = request.form.get('phone', '').strip()
+    password = request.form.get('password', '').strip()
+
+    if phone not in pending_auths:
+        return redirect(f'/add/{SECRET}')
+
+    client = pending_auths[phone]['client']
+
+    try:
+        # Same client that got SessionPasswordNeededError — runs on the same _bg_loop
+        run_async(client.sign_in(password=password))
+        session_str = client.session.save()
+        run_async(client.disconnect())
+        del pending_auths[phone]
+
+        render_ok  = add_session_to_render(session_str)
+        render_msg = ('✅ Added to Render automatically — redeploying now.'
+                      if render_ok else
+                      '⚠️ Could not update Render automatically. Copy the string below.')
+        logger.info('Session saved (2FA) for %s — Render: %s', phone, render_ok)
+        return f'''<!DOCTYPE html><html><head><title>✅ Added</title>{CSS}</head><body>
+<h2>✅ Phone Added!</h2>
+<p>{render_msg}</p>
+<p style="color:#aaa">Session string (keep this safe):</p>
+<div class="box">{session_str}</div>
+<br><a href="/add/{SECRET}">➕ Add another number</a>
+</body></html>'''
+
+    except Exception as e:
+        logger.error('add_password error: %s', e)
+        return f'''<!DOCTYPE html><html><head><title>Error</title>{CSS}</head><body>
+<h2>❌ Password Failed</h2>
 <div class="box err">{e}</div>
 <a href="/add/{SECRET}">← Try again</a></body></html>'''
 
@@ -654,6 +658,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     logger.info('Monitor bot starting on 0.0.0.0:%d', port)
     app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
+
 
 
 
