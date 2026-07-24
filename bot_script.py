@@ -382,7 +382,9 @@ def add_password():
     loop   = auth['loop']
 
     try:
-        loop.run_until_complete(client.sign_in(password=password))
+        async def _do_2fa():
+            return await client.sign_in(password=password)
+        loop.run_until_complete(_do_2fa())
         return _finish_session(phone, client, loop)
     except Exception as e:
         logger.error('add_password error: %s', e)
@@ -635,4 +637,5 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 10000))
     logger.info('Monitor bot starting on 0.0.0.0:%d', port)
     app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
+
 
