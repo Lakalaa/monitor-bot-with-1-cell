@@ -190,6 +190,36 @@ def is_advertisement(text: str) -> bool:
         return True
     return False
 
+# ── Market analysis / price commentary detector ──────────────────────────────
+# These are analytical posts, NOT user issues, even when they contain "I"
+_MARKET_ANALYSIS_RE = re.compile(
+    # Chart / TA language
+    r"\b(trendline|trend\s+line|resistance\s+(zone|level|area)|support\s+(zone|level|area)"
+    r"|ascending\s+trendline|descending\s+trendline"
+    r"|breakout|break\s+out|rebound|bounce\s+back"
+    r"|bullish|bearish|bull\s+run|bear\s+market"
+    r"|moving\s+average|ema|sma|rsi|macd|bollinger"
+    r"|fibonacci|fib\s+level|golden\s+cross|death\s+cross"
+    r"|higher\s+high|lower\s+low|price\s+action"
+    r"|overbought|oversold|consolidat"
+    r"|\d+H\s+chart|\d+h\s+chart|4h|1h|daily\s+chart|weekly\s+chart"
+    r"|\btf\b|timeframe|candle|wick|doji"
+    r")\b"
+    # Price target format: "64K", "65.5K–66K", "$64,000"
+    r"|\b\d{2,3}(\.\d+)?[Kk]\s*(resistance|support|level|zone|target|area)"
+    r"|\b\d{2,3}(\.\d+)?[Kk][-–]\d{2,3}(\.\d+)?[Kk]\b"
+    # Prediction / expectation phrases (not personal problems)
+    r"|\bi\s+expect\s+(btc|eth|sol|bnb|the\s+market|price|it)\s+to\b"
+    r"|\bi\s+can\s+see\s+(btc|eth|bitcoin|price|the\s+market)\b"
+    r"|\bpave\s+the\s+way\b"
+    r"|\b(sellers?|buyers?)\s+(may|might|could|will)\s+become\s+(active|dominant)\b"
+    r"|\b(market|price)\s+is\s+approaching\s+a\s+decisive\b",
+    re.I | re.S
+)
+
+def is_market_analysis(text: str) -> bool:
+    return bool(_MARKET_ANALYSIS_RE.search(text))
+
 def categorize(text: str) -> list:
     t = text.lower()
     matched = [cat for cat, kws in CATEGORIES.items() if any(kw in t for kw in kws)]
@@ -355,7 +385,7 @@ def capture(msg: dict, session_num: int = 0, msg_id: int = None):
         return
     _seen_msgs.append(dedup_key)
     # Scam and advertisement filter
-    if is_scam(text) or is_advertisement(text):
+    if is_scam(text) or is_advertisement(text) or is_market_analysis(text):
         return
 
     cats     = categorize(text)
