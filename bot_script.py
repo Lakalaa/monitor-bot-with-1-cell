@@ -97,11 +97,27 @@ SCAM_WORDS = {
     'i can help you recover', 'i will help you recover',
     'guaranteed profit', 'guaranteed roi', 'passive income guarantee',
     'connect your wallet to claim', 'ponzi',
+    # adult content
+    'sex tape', 'leaked video', 'leaked content', 'onlyfans',
+    'adult content', 'hot content', 'leaked nude',
 }
+
+# Bot-link spam: t.me deep links with startapp= are always bots, never user issues
+import urllib.parse as _up
+_TG_BOT_LINK_RE = re.compile(
+    r'(https?://)?t\.me/\w+\?startapp=|'   # Telegram bot deep links
+    r'(https?://)?t\.me/\w+bot',           # any @…bot username link
+    re.I
+)
+_ADULT_EMOJI_RE = re.compile(r'[🔞💦👅🍆]')  # 🔞💦👅🍆
 
 def is_scam(text: str) -> bool:
     t = text.lower()
     if any(w in t for w in SCAM_WORDS):
+        return True
+    if _TG_BOT_LINK_RE.search(text):
+        return True
+    if _ADULT_EMOJI_RE.search(text):
         return True
     return any(r.search(text) for r in SCAM_RE)
 
@@ -181,28 +197,49 @@ def categorize(text: str) -> list:
 
 _FIRST_PERSON_RE = re.compile(r"\b(i|my|me|mine|i've|i'm|i'd|i'll|ive|im)\b", re.I)
 
+# Strong problem signals that alone (without first-person) are enough
+_STRONG_PROBLEM_RE = re.compile(
+    r"\bcan'?t\s+(sell|buy|swap|withdraw|transfer|connect|access|login|sign)"
+    r"|\b(swap|transfer|withdraw|transaction|tx)\s+(fail|failed|stuck|pending)"
+    r"|\b(i\s+have\s+a?\s*complain|i\s+lost|i\s+got\s+(scammed|rugged|hit))"
+    r"|\b(blacklisted|rug\s*pull|rugged|scammed\s+me)"
+    r"|\bno\s+(response|reply)\s+(from|in)\s+\d"
+    r"|\b(nothing\s+)?(happen|show|appear|work)(s|ed|ing)?\s*after\s+\d",
+    re.I
+)
+
 def is_high_priority(cats: list, text: str) -> bool:
     t = text.lower()
 
-    # Must have first-person language — no first person = not a personal report
-    if not _FIRST_PERSON_RE.search(t):
-        return False
-
-    # Something must have gone wrong — any problem word + first person = real issue
+    # Broad problem words — need first-person too
     problem = [
         'stuck', 'failed', 'fail', 'not received', 'not arrived', 'not showing',
         'not confirmed', 'not credited', 'not reflected', 'not working',
+        'not able', "doesn't work", "didn't work", 'wont work',
         'missing', 'disappeared', 'wrong amount', 'short',
         'still pending', 'still waiting', 'still not', 'never arrived', 'never got',
         'hours ago', 'days ago', 'since yesterday', 'since last',
         'error', 'rejected', 'reverted', 'invalid', 'issue', 'problem',
+        'complain', 'complaint',
         "can't withdraw", 'cant withdraw', 'withdraw failed', 'withdrawal failed',
         'swap failed', 'transfer failed', 'transaction failed', 'tx failed',
+        "can't sell", "cant sell", "can't buy", "cant buy",
         'not letting', 'wont let', "won't", 'unable', 'cannot', "can't",
-        'lost', 'no response', 'support', 'help',
+        'lost', 'no response', 'support', 'help', 'blacklisted',
+        'scammed', 'rug', 'got hit',
     ]
 
-    return any(p in t for p in problem)
+    has_first_person = bool(_FIRST_PERSON_RE.search(t))
+    has_problem = any(p in t for p in problem)
+
+    if has_first_person and has_problem:
+        return True
+
+    # Strong signals that don't need first-person
+    if _STRONG_PROBLEM_RE.search(text):
+        return True
+
+    return False
 
 def _now():
     return datetime.utcnow().strftime('%Y-%m-%d %H:%M')
@@ -456,8 +493,6 @@ def add_verify():
     pch    = auth['phone_code_hash']
 
     try:
-        if not client.is_connected():
-            run_async(client.connect())
         run_async(client.sign_in(phone, code, phone_code_hash=pch))
         # Success — no 2FA
         session_str = client.session.save()
@@ -510,8 +545,6 @@ def add_password():
 
     try:
         # Same client that got SessionPasswordNeededError — runs on the same _bg_loop
-        if not client.is_connected():
-            run_async(client.connect())
         run_async(client.sign_in(password=password))
         session_str = client.session.save()
         run_async(client.disconnect())
