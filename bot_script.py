@@ -197,46 +197,95 @@ def categorize(text: str) -> list:
 
 _FIRST_PERSON_RE = re.compile(r"\b(i|my|me|mine|i've|i'm|i'd|i'll|ive|im)\b", re.I)
 
-# Strong problem signals that alone (without first-person) are enough
-_STRONG_PROBLEM_RE = re.compile(
-    r"\bcan'?t\s+(sell|buy|swap|withdraw|transfer|connect|access|login|sign)"
-    r"|\b(swap|transfer|withdraw|transaction|tx)\s+(fail|failed|stuck|pending)"
-    r"|\b(i\s+have\s+a?\s*complain|i\s+lost|i\s+got\s+(scammed|rugged|hit))"
-    r"|\b(blacklisted|rug\s*pull|rugged|scammed\s+me)"
-    r"|\bno\s+(response|reply)\s+(from|in)\s+\d"
-    r"|\b(nothing\s+)?(happen|show|appear|work)(s|ed|ing)?\s*after\s+\d",
-    re.I
+# Signals strong enough to forward WITHOUT first-person language
+_STRONG_RE = re.compile(
+    # Transaction failures — explicit
+    r"\b(swap|transfer|withdraw|transaction|tx|buy|sell|stake|bridge)\s+"
+    r"(fail|failed|failing|stuck|pending|revert|reverted|rejected|not\s+go)\b"
+    r"|\bexecution\s+reverted\b"
+    r"|\bdeadline\s+exceeded\b"
+    r"|\binsufficient\s+(funds?|balance|gas|liquidity)\b"
+    r"|\b(gas|slippage|price\s+impact)\s+(too\s+high|error|fail)"
+    # Can't do action — no first-person needed
+    r"|\bcan'?t\s+(sell|buy|swap|withdraw|transfer|connect|access|stake|bridge|unstake)\b"
+    r"|\bcannot\s+(sell|buy|swap|withdraw|transfer|connect|access|stake|bridge)\b"
+    # Community-wide issue signals
+    r"|\banyone\s+else\s+(hav|experienc|getting|having|seeing|facing)\b"
+    r"|\bsame\s+(issue|problem|thing|error|bug)\b"
+    r"|\bstill\s+(no|not)\s+(received|showing|confirmed|credited|reflected|working)\b"
+    # Time-based complaints
+    r"|\b(waited?|waiting)\s+\d+\s*(hour|hr|min|day)"
+    r"|\b\d+\s*(hour|hr|day)s?\s+(and|but)\s+still\b"
+    r"|\b(since|for)\s+(yesterday|last\s+\w+|\d+\s*(hour|day|week))"
+    # Missing funds
+    r"|\b(fund|token|balance|deposit|withdrawal)s?\s+(gone|missing|disappear|vanish|lost|not\s+show)\b"
+    r"|\bwhere\s+(is|are)\s+my\s+(fund|token|balance|money|deposit|withdrawal)\b"
+    r"|\bwhat\s+happen(ed)?\s+to\s+my\s+(fund|token|balance|money|deposit)\b"
+    # Wallet/network stuck
+    r"|\bwrong\s+(network|chain)\b"
+    r"|\bwallet\s+(not|won'?t|can'?t)\s+(connect\w*|load\w*|work\w*|sign\w*|open)\b"
+    r"|\b(metamask|phantom|trust\s+wallet|coinbase\s+wallet)\s+(error|issue|problem|not|stuck)\b"
+    # Liquidation / loss
+    r"|\b(got|been|i'?m)\s+(rekt|liquidated|rugged|scammed|blacklisted)\b"
+    r"|\b(rug\s*pull|rugpull|rug\s*pulled)\b"
+    # Why questions about personal failures
+    r"|\bwhy\s+(is|did|can'?t|won'?t|doesn'?t|isn'?t)\s+(my|the)\s+"
+    r"(transaction|tx|swap|transfer|withdraw|token|balance|fund)\b",
+    re.I | re.S
 )
+
+# ── All the ways a user says something went wrong ─────────────────────────────
+_PROBLEM_WORDS = {
+    # Transaction state
+    'stuck', 'failed', 'fail', 'failing', 'keeps failing', 'keeps reverting',
+    'not received', 'not arrived', 'not showing', 'not confirmed', 'not credited',
+    'not reflected', 'not working', 'not processing', 'not going through',
+    'not letting', 'not loading', 'not appearing',
+    # Grammar variants
+    "doesn't work", "didn't work", "doesn't show", "didn't receive",
+    "doesn't go", "didn't go", "doesn't load", "didn't load",
+    'wont work', 'wont go', 'wont send', 'wont load', 'wont let',
+    "won't", "can't", 'cant', 'unable', 'cannot',
+    # Time waiting
+    'still pending', 'still waiting', 'still not', 'still no',
+    'never arrived', 'never got', 'never received', 'never showed',
+    'been waiting', 'waited', 'hours ago', 'days ago',
+    'since yesterday', 'since last', 'since this morning',
+    # Missing
+    'missing', 'disappeared', 'gone', 'vanished', 'not there',
+    'wrong amount', 'wrong balance', 'short', 'less than',
+    # Error words
+    'error', 'rejected', 'reverted', 'invalid', 'execution reverted',
+    'deadline exceeded', 'nonce', 'insufficient', 'gas fee',
+    # Issue words
+    'issue', 'problem', 'trouble', 'complain', 'complaint', 'bug',
+    'broken', 'down', 'offline', 'not available',
+    # Action failures (with first-person)
+    'withdraw failed', 'withdrawal failed', 'swap failed',
+    'transfer failed', 'transaction failed', 'tx failed', 'bridge failed',
+    'stake failed', 'unstake failed', 'claim failed',
+    # Help seeking
+    'lost', 'no response', 'no reply', 'support', 'help me', 'please help',
+    'how do i fix', 'how to fix', 'fix this', 'please fix',
+    # Negative outcomes
+    'blacklisted', 'scammed', 'rugged', 'rug', 'rekt', 'liquidated',
+    'got hit', 'front run', 'sandwiched',
+    # Wallet
+    'wrong network', 'wrong chain', 'switch network', 'metamask',
+    # Question-based complaints (with first-person)
+    'why is my', 'why did my', "why can't i", "why cant i",
+    'what happened to my', 'where is my', 'where are my',
+}
 
 def is_high_priority(cats: list, text: str) -> bool:
     t = text.lower()
 
-    # Broad problem words — need first-person too
-    problem = [
-        'stuck', 'failed', 'fail', 'not received', 'not arrived', 'not showing',
-        'not confirmed', 'not credited', 'not reflected', 'not working',
-        'not able', "doesn't work", "didn't work", 'wont work',
-        'missing', 'disappeared', 'wrong amount', 'short',
-        'still pending', 'still waiting', 'still not', 'never arrived', 'never got',
-        'hours ago', 'days ago', 'since yesterday', 'since last',
-        'error', 'rejected', 'reverted', 'invalid', 'issue', 'problem',
-        'complain', 'complaint',
-        "can't withdraw", 'cant withdraw', 'withdraw failed', 'withdrawal failed',
-        'swap failed', 'transfer failed', 'transaction failed', 'tx failed',
-        "can't sell", "cant sell", "can't buy", "cant buy",
-        'not letting', 'wont let', "won't", 'unable', 'cannot', "can't",
-        'lost', 'no response', 'support', 'help', 'blacklisted',
-        'scammed', 'rug', 'got hit',
-    ]
-
-    has_first_person = bool(_FIRST_PERSON_RE.search(t))
-    has_problem = any(p in t for p in problem)
-
-    if has_first_person and has_problem:
+    # Strong signals — forward regardless of first-person
+    if _STRONG_RE.search(text):
         return True
 
-    # Strong signals that don't need first-person
-    if _STRONG_PROBLEM_RE.search(text):
+    # First-person + any problem word
+    if _FIRST_PERSON_RE.search(t) and any(p in t for p in _PROBLEM_WORDS):
         return True
 
     return False
