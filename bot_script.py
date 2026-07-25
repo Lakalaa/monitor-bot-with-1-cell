@@ -496,29 +496,91 @@ a{color:#00ff88}
 
 
 # ── QR-code login route ────────────────────────────────────────────────────────
-_qr_pending: dict = {}   # token → {client, future}
+# State shared between routes (one pending QR session at a time)
+_qr: dict = {}
+
+def _qr_reset():
+    _qr.clear()
+    _qr.update(client=None, qr_url='', done=False, ok=False, msg='', started=False)
+
+_qr_reset()
+
+def _qr_wait_thread():
+    # Runs in a daemon thread. Keeps renewing the QR until scanned or 5-min timeout.
+    import time as _time
+    from telethon.errors import SessionPasswordNeededError
+    deadline = _time.time() + 300
+    while _time.time() < deadline and not _qr['done']:
+        try:
+            qr_obj = run_async(_qr['client'].qr_login())
+            _qr['qr_url'] = qr_obj.url
+            logger.info('QR token refreshed')
+            try:
+                run_async(qr_obj.wait(), timeout=28)
+                # Scanned!
+                sess = _qr['client'].session.save()
+                ok   = add_session_to_render(sess)
+                _qr.update(done=True, ok=ok,
+                            msg='Session added! Bot is now monitoring this account.' if ok else sess[:80])
+                logger.info('QR login success; Render add=%s', ok)
+                run_async(_qr['client'].disconnect())
+                return
+            except asyncio.TimeoutError:
+                logger.info('QR wait timeout — regenerating token')
+                continue
+            except SessionPasswordNeededError:
+                _qr.update(done=True, ok=False,
+                            msg='2FA required — use /add/monitorbot instead')
+                run_async(_qr['client'].disconnect())
+                return
+        except Exception as exc:
+            _qr.update(done=True, ok=False, msg=str(exc))
+            logger.exception('QR wait error: %s', exc)
+            try:
+                run_async(_qr['client'].disconnect())
+            except Exception:
+                pass
+            return
+    if not _qr['done']:
+        _qr.update(done=True, ok=False,
+                    msg='Timed out after 5 minutes. Refresh the page to try again.')
+        try:
+            run_async(_qr['client'].disconnect())
+        except Exception:
+            pass
 
 @app.route(f'/qr/{SECRET}')
 def qr_page():
-    """Serve a page that shows a live QR code the user scans in Telegram."""
-    return f'''<!DOCTYPE html><html><head><title>QR Login</title>{CSS}
-<meta http-equiv="refresh" content="4">
-</head><body>
-<h2>📱 QR Code Login</h2>
-<p>Open Telegram on <b>+542214545648</b> (or any account):<br>
-<b>Settings → Devices → Link Desktop Device</b> → scan the code below.</p>
-<p>Page refreshes every 4 seconds. Once scanned, you'll see a success message.</p>
-<img src="/qr/{SECRET}/image" style="width:260px;height:260px;border:4px solid #00ff88;border-radius:8px">
-<br><br>
-<div id="status" class="box" style="font-size:13px">Waiting for scan…</div>
-<script>
-fetch("/qr/{SECRET}/check").then(r=>r.json()).then(d=>{{
-  if(d.done) document.getElementById("status").innerHTML =
-    d.ok ? "✅ <b>Session added!</b> Bot is now monitoring this account." :
-           "❌ " + d.msg;
-}});
-</script>
-</body></html>'''
+    return (
+        '<!DOCTYPE html><html><head><title>QR Login</title>' + CSS +
+        '<meta http-equiv="refresh" content="4">'
+        '</head><body>'
+        '<h2>\U0001f4f1 QR Code Login \u2014 second account</h2>'
+        '<p>Open Telegram on the <b>second phone/account</b>:<br>'
+        '<b>Settings \u2192 Devices \u2192 Link Desktop Device</b> \u2192 scan below.</p>'
+        '<p>The QR refreshes every ~28 seconds automatically.</p>'
+        '<img id="qr" src="/qr/' + SECRET + '/image?t=1"'
+        ' style="width:260px;height:260px;border:4px solid #00ff88;border-radius:8px"'
+        ' onerror="this.style.opacity=0.3">'
+        '<br><br>'
+        '<div id="status" class="box" style="font-size:13px">Waiting for scan\u2026</div>'
+        '<script>'
+        '(function poll(){'
+        'fetch("/qr/' + SECRET + '/check").then(r=>r.json()).then(d=>{'
+        'if(d.done){'
+        'document.getElementById("status").innerHTML='
+        'd.ok?"✅ <b>"+d.msg+"</b>":"❌ "+d.msg;'
+        'if(!d.ok)setTimeout(poll,5000);'
+        '}else{setTimeout(poll,3000);}'
+        '}).catch(()=>setTimeout(poll,5000));'
+        '})();'
+        'setInterval(()=>{'
+        'var img=document.getElementById("qr");'
+        'img.src="/qr/' + SECRET + '/image?t="+Date.now();'
+        '},28000);'
+        '</script>'
+        '</body></html>'
+    )
 
 @app.route(f'/qr/{SECRET}/image')
 def qr_image():
@@ -526,55 +588,37 @@ def qr_image():
     from flask import Response
     import qrcode as _qrcode
 
-    # Start or reuse QR session
-    if 'client' not in _qr_pending or not run_async(_qr_pending['client'].is_connected()):
+    # If no session started, or previous one finished, start fresh
+    if not _qr['started'] or _qr['done']:
+        _qr_reset()
         from telethon import TelegramClient
         from telethon.sessions import StringSession
-        client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH, loop=_bg_loop)
+        # Do NOT pass loop= (deprecated in Python 3.10+); assign it directly.
+        client = TelegramClient(StringSession(), TG_API_ID, TG_API_HASH)
+        client.loop = _bg_loop
         run_async(client.connect())
-        qr_obj = run_async(client.qr_login())
-        _qr_pending.clear()
-        _qr_pending['client']  = client
-        _qr_pending['qr']      = qr_obj
-        _qr_pending['done']    = False
-        _qr_pending['ok']      = False
-        _qr_pending['msg']     = ''
-        # Start background task that waits for the scan
-        import threading
-        def _wait():
-            try:
-                from telethon.errors import SessionPasswordNeededError
-                run_async(_qr_pending['qr'].wait(), timeout=120)
-                sess = _qr_pending['client'].session.save()
-                ok = add_session_to_render(sess)
-                _qr_pending['done'] = True
-                _qr_pending['ok']   = ok
-                _qr_pending['msg']  = 'Added to Render.' if ok else sess[:80]
-                logger.info('QR login success — Render: %s', ok)
-                run_async(_qr_pending['client'].disconnect())
-            except SessionPasswordNeededError:
-                _qr_pending['done'] = True
-                _qr_pending['ok']   = False
-                _qr_pending['msg']  = '2FA password required — use /add/{SECRET} instead'
-                run_async(_qr_pending['client'].disconnect())
-            except Exception as e:
-                _qr_pending['done'] = True
-                _qr_pending['ok']   = False
-                _qr_pending['msg']  = str(e)
-        threading.Thread(target=_wait, daemon=True).start()
+        _qr['client']  = client
+        _qr['started'] = True
+        threading.Thread(target=_qr_wait_thread, daemon=True, name='qr-wait').start()
+        # Brief pause so the thread can populate qr_url
+        import time as _t; _t.sleep(1.5)
+
+    url = _qr.get('qr_url', '')
+    if not url:
+        return Response(b'', status=204)
 
     buf = io.BytesIO()
-    _qrcode.make(_qr_pending['qr'].url).save(buf, format='PNG')
+    _qrcode.make(url).save(buf, format='PNG')
     buf.seek(0)
     return Response(buf.getvalue(), mimetype='image/png',
-                    headers={'Cache-Control': 'no-store'})
+                    headers={'Cache-Control': 'no-store, no-cache'})
 
 @app.route(f'/qr/{SECRET}/check')
 def qr_check():
     from flask import jsonify
-    return jsonify(done=_qr_pending.get('done', False),
-                   ok=_qr_pending.get('ok', False),
-                   msg=_qr_pending.get('msg', ''))
+    return jsonify(done=_qr.get('done', False),
+                   ok=_qr.get('ok', False),
+                   msg=_qr.get('msg', ''))
 
 @app.route(f'/add/{SECRET}')
 def add_page():
