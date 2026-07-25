@@ -63,47 +63,39 @@ CATEGORIES = {
 }
 
 SCAM_PATTERNS = [
-    # Money promises
-    r'send\s+\d+', r'double\s+your', r'100%\s+profit', r'\d+x\s+(profit|return|gain)',
-    r'guaranteed\s+(profit|return|gain|roi)', r'get\s+back\s+\d+x',
-    r'(make|earn)\s+\$?\d+.*?(day|week|month)', r'(paid|earn).*weekly',
-    r'turn\s+.{0,30}into', r'investment\s+plan', r'managed\s+(account|fund)',
-    r'copy\s*trad(e|ing)', r'signal(s)?\s+(group|service|provider)',
-    r'profit\s+sharing', r'\d{2,}%\s+(daily|weekly|monthly)',
-    # Credentials theft
-    r'private\s+key', r'seed\s+phrase', r'recovery\s+phrase', r'secret\s+phrase',
-    r'mnemonic', r'wallet\s+passphrase',
-    # Recovery scams
-    r'(recover|reclaim|retrieve|get\s+back)\s+(your\s+)?(lost|stolen|missing)\s+(fund|token|coin|crypto|money)',
-    r'recovery\s+(expert|specialist|service)', r'funds?\s+recovery',
-    r'help\s+you\s+recover', r'i\s+(can|will)\s+(help|recover|retrieve)',
-    r'(helped|recovered)\s+.{0,30}(fund|token|crypto)',
-    # Unsolicited contact / DM pushing
-    r'dm\s+me', r'message\s+me', r'chat\s+me', r'inbox\s+me',
-    r'reach\s+(out|me)', r'contact\s+me', r'add\s+me',
-    r'text\s+me\s+(now|for|to|via)', r'whatsapp\s+me',
+    # Seed/key theft — never legitimate
+    r'private\s+key', r'seed\s+phrase', r'recovery\s+phrase',
+    r'secret\s+phrase', r'mnemonic', r'wallet\s+passphrase',
+    # Recovery scammer phrases — targeting others, not self
+    r'help\s+you\s+recover', r'i\s+can\s+help\s+you',
+    r'recovery\s+(expert|specialist|service)',
+    r'(recover|reclaim)\s+(your\s+)?(lost|stolen|missing)\s+(fund|token|coin|crypto)',
+    r'@\w+\s+(can\s+help|helped\s+me|recovered\s+my)',
+    # Guaranteed profit / money promises
+    r'guaranteed\s+(profit|return|gain|roi)',
+    r'double\s+your\s+(money|crypto|investment)',
+    r'(make|earn)\s+\$\d+.*?(day|week|month)',
+    r'\d{2,}%\s+(daily|weekly|monthly)\s+(profit|return|roi)',
+    r'100%\s+(profit|return|guaranteed)',
+    # Unsolicited DM pushing (scammer pattern — directing to private chat)
+    r'dm\s+me\s+(now|for|to|if)',
+    r'inbox\s+me\s+(now|for|to)',
+    r'text\s+me\s+(now|for|to|via)',
+    r'whatsapp\s+me',
     r'contact\s+(support|admin)\s+via\s+(dm|telegram|whatsapp)',
-    r'my\s+(telegram|whatsapp|instagram|twitter)\s+is\s+@?\w+',
-    r'@\w+\s+(can\s+help|helped\s+me|recovered)',
-    # Fake claims
+    # Fake claim / wallet drain
     r'click\s+here\s+to\s+(claim|connect|verify)',
     r'claim\s+your\s+(free|airdrop|reward|bonus)',
-    r'limited\s+time\s+(offer|deal)', r'exclusive\s+(offer|deal|access)',
-    r'mining\s+(contract|plan|pool|rig)', r'presale\s+(access|slot|whitelist)',
-    r'whitelist\s+(spot|access|free)', r'free\s+(tokens?|nft|crypto|airdrop)',
-    r'connect\s+your\s+wallet\s+to', r'verify\s+your\s+wallet',
-    # Promotions / shilling
-    r'(buy|invest)\s+(now|today|fast|quick)', r'don\'t\s+miss\s+(out|this)',
-    r'gem\s+(alert|found|discover)', r'next\s+\d+x', r'moon\s+soon',
-    r'100x\s+potential', r'early\s+(investor|access|bird)',
+    r'connect\s+your\s+wallet\s+to\s+(claim|receive|get)',
+    r'verify\s+your\s+wallet\s+to',
+    r'free\s+(tokens?|nft|crypto)\s+(airdrop|giveaway|claim)',
 ]
 SCAM_RE = [re.compile(p, re.I | re.S) for p in SCAM_PATTERNS]
 SCAM_WORDS = {
-    'ponzi', 'giveaway', 'passive income guarantee', 'roi guaranteed',
-    'connect your wallet to claim', 'admin dm', 'pump incoming',
-    'presale open', 'whitelist open', 'copy trade', 'managed account',
-    'investment opportunity', 'get rich', 'financial freedom guaranteed',
-    'i can help you recover', 'dm for help', 'message me for help',
+    'seed phrase', 'private key', 'recovery phrase',
+    'i can help you recover', 'i will help you recover',
+    'guaranteed profit', 'guaranteed roi', 'passive income guarantee',
+    'connect your wallet to claim', 'ponzi',
 }
 
 def is_scam(text: str) -> bool:
