@@ -456,6 +456,8 @@ def add_verify():
     pch    = auth['phone_code_hash']
 
     try:
+        if not client.is_connected():
+            run_async(client.connect())
         run_async(client.sign_in(phone, code, phone_code_hash=pch))
         # Success — no 2FA
         session_str = client.session.save()
@@ -508,6 +510,8 @@ def add_password():
 
     try:
         # Same client that got SessionPasswordNeededError — runs on the same _bg_loop
+        if not client.is_connected():
+            run_async(client.connect())
         run_async(client.sign_in(password=password))
         session_str = client.session.save()
         run_async(client.disconnect())
