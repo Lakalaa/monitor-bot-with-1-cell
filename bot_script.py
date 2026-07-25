@@ -1,4 +1,4 @@
-import os, json, re, asyncio, logging, threading
+import os, json, re, asyncio, logging, threading, time
 from datetime import datetime
 from collections import deque
 from flask import Flask, request, abort, redirect
@@ -25,6 +25,7 @@ joined_groups: dict = {}
 sessions: dict      = {}
 pending_auths: dict = {}  # phone → {client, phone_code_hash, code?}
 _seen_msgs    = deque(maxlen=5000)  # dedup: (chat_id, msg_id)
+_admin_cache: dict = {}             # chat_id -> (frozenset of admin user_ids, fetched_ts)
 
 # Single background event loop — all Telethon ops run here, no threading issues
 _bg_loop = asyncio.new_event_loop()
@@ -837,26 +838,23 @@ def _start_userbot():
                 # Block bots, channel posts (sender=None), and non-user senders
                 if sender is None or not isinstance(sender, User) or sender.bot:
                     return
-                # Skip admins, moderators, creators — only alert on regular users
-                try:
-                    from telethon.tl.types import (
-                        ChannelParticipantAdmin, ChannelParticipantCreator,
-                        ChatParticipantAdmin, ChatParticipantCreator,
-                    )
-                    participant = await client.get_participant(chat, sender)
-                    if isinstance(participant, (
-                        ChannelParticipantAdmin, ChannelParticipantCreator,
-                        ChatParticipantAdmin, ChatParticipantCreator,
-                    )):
-                        return
-                except Exception:
-                    # Fallback: try get_permissions
+                # Skip admins — use cached list (O(1) lookup, no API call per message)
+                cid = event.chat_id
+                cached = _admin_cache.get(cid)
+                if cached is None or time.time() - cached[1] > 1800:
+                    # Refresh admin list (once per group per 30 min)
                     try:
-                        perms = await client.get_permissions(chat, sender)
-                        if perms and (perms.is_admin or perms.is_creator):
-                            return
+                        from telethon.tl.types import ChannelParticipantsAdmins
+                        admins = await client.get_participants(chat, filter=ChannelParticipantsAdmins())
+                        admin_ids = frozenset(u.id for u in admins)
+                        _admin_cache[cid] = (admin_ids, time.time())
                     except Exception:
-                        pass
+                        admin_ids = cached[0] if cached else frozenset()
+                        _admin_cache[cid] = (admin_ids, time.time())
+                else:
+                    admin_ids = cached[0]
+                if sender.id in admin_ids:
+                    return
                 text = (event.message.text or event.message.message or '').strip()
                 if not text:
                     return
@@ -887,10 +885,20 @@ def _start_userbot():
         logger.info('UB #%d connected as @%s', num, me_name)
         sessions[num] = me_name
         await apply_stealth(client, num)
-        # Silent start — no notification
         await scan_dialogs()
-        logger.info('UB #%d watching in stealth mode', num)
+        logger.info('UB #%d watching', num)
         await client.run_until_disconnected()
+
+    async def run_one_forever(num, session_str):
+        """Restart session automatically on any crash — never stops."""
+        backoff = 5
+        while True:
+            try:
+                await run_one(num, session_str)
+            except Exception as e:
+                logger.error('UB #%d crashed: %s — restarting in %ds', num, e, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 120)  # cap at 2 min
 
     async def ub_main():
         ub_sessions = get_ub_sessions()
@@ -899,7 +907,7 @@ def _start_userbot():
             await asyncio.sleep(30)
             ub_sessions = get_ub_sessions()
         logger.info('UB: starting %d session(s)', len(ub_sessions))
-        await asyncio.gather(*[run_one(n, s) for n, s in ub_sessions])
+        await asyncio.gather(*[run_one_forever(n, s) for n, s in ub_sessions])
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
