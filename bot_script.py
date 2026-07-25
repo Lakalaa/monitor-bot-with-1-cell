@@ -232,13 +232,13 @@ _STRONG_RE = re.compile(
     # Any action that failed / is stuck
     r"\b(swap|transfer|withdraw|withdrawal|deposit|transaction|tx|buy|sell|stake"
     r"|unstake|bridge|claim|send|receive|approve|mint|redeem|convert)\s*"
-    r"(fail(ed|ing)?|stuck|pending|revert(ed)?|rejected|not\s+go(ing)?|not\s+work(ing)?|not\s+complet|error)\b"
+    r"(fail(ed|ing)?|stuck|pending|revert(ed)?|rejected|not\s+go(ing)?|not\s+work(ing)?|not\s+complet\w*|error)\b"
     r"|\bexecution\s+reverted\b"
     r"|\bdeadline\s+exceeded\b"
     r"|\binsufficient\s+(funds?|balance|gas|liquidity)\b"
     r"|\b(gas|slippage|price\s+impact)\s+(too\s+high|error|fail)"
     # Can't do action — no first-person needed
-    r"|\bcan'?t\s+(sell|buy|swap|withdraw|transfer|connect|access|stake|bridge|unstake|claim|send|receive|log\s+in|login|sign\s+in)\b"
+    r"|\bcan'?t\s+(sell|buy|swap|withdraw|transfer|connect|access|stake|bridge|unstake|claim|send|receive|log\s*in|sign\s*in)\b"
     r"|\bcannot\s+(sell|buy|swap|withdraw|transfer|connect|access|stake|bridge|claim|send|receive)\b"
     r"|\bunable\s+to\s+(swap|withdraw|transfer|connect|access|stake|bridge|claim|send|receive|buy|sell)\b"
     # Community question patterns — any variant
@@ -268,7 +268,7 @@ _STRONG_RE = re.compile(
     # Wallet issues
     r"|\bwrong\s+(network|chain|address|amount)\b"
     r"|\bwallet\s+(not|won'?t|can'?t|isn'?t)\s+(connect\w*|load\w*|work\w*|sign\w*|open\w*|link\w*)\b"
-    r"|\b(metamask|phantom|trust\s*wallet|coinbase\s*wallet|wallet\s*connect|rabby|ledger|trezor)\s+(error|issue|problem|not\s+work\w*|stuck|disconnect\w*|fail\w*)\b"
+    r"|\b(metamask|phantom|trust\s*wallet|coinbase\s*wallet|walletconnect|rabby|ledger|trezor)\s+(error|issue|problem|not\s+work\w*|stuck|disconnect\w*|fail\w*)\b"
     r"|\bwallet\s+(disconnect\w*|keep\s+disconnect\w*)\b"
     # Deducted but not received
     r"|\b(deducted|charged|debited)\s+(but|and)\s+(not|never)\s+(received|credited|arrived|showing|reflected)\b"
@@ -277,13 +277,12 @@ _STRONG_RE = re.compile(
     r"|\b(account|wallet|address)\s+(block\w*|restrict\w*|suspend\w*|ban\w*|frozen|locked)\b"
     r"|\bblacklist\w*\b"
     r"|\bcan'?t\s+(log\s*in|sign\s*in|access|open)\b"
-    # Loss / scam (personal)
+    # Personal loss / scam
     r"|\b(got|been|i'?m|i\s+was)\s+(rekt|liquidated|rugged|scammed|hacked|drained|blacklisted|front.?run|sandwich\w*)\b"
     r"|\b(rug\s*pull|rugpull|rug\s*pulled|exit\s*scam)\b"
     # Why questions
-    r"|\bwhy\s+(is|did|can'?t|won'?t|doesn'?t|isn'?t|hasn'?t|haven'?t)\s+(my|the|it|this)\s*"
-    r"(transaction|tx|swap|transfer|withdraw\w*|token|balance|fund|deposit|money|coin)?\b"
-    # Complaint / asking for help
+    r"|\bwhy\s+(is|did|can'?t|won'?t|doesn'?t|isn'?t|hasn'?t|haven'?t)\s+(my|the|it|this)\b"
+    # Asking for help / complaining
     r"|\b(please|pls|plz)\s+(help|assist|fix|check|look|respond|reply)\b"
     r"|\bneed\s+(help|support|assistance)\b"
     r"|\bno\s+(response|reply)\s+(from\s+)?(support|team|admin)\b"
@@ -293,53 +292,53 @@ _STRONG_RE = re.compile(
     re.I | re.S
 )
 
-# ── Problem words (used with first-person check as fallback) ──────────────────
+# ── Problem words (used with first-person as fallback) ────────────────────────
 _PROBLEM_WORDS = {
-    # Transaction state
     'stuck', 'failed', 'fail', 'failing', 'keeps failing', 'keeps reverting',
     'not received', 'not arrived', 'not showing', 'not confirmed', 'not credited',
     'not reflected', 'not working', 'not processing', 'not going through',
     'not letting', 'not loading', 'not appearing', 'not completing',
     'not deposited', 'not withdrawn', 'not transferred', 'not swapped',
-    # Grammar variants
     "doesn't work", "didn't work", "doesn't show", "didn't receive",
     "doesn't go", "didn't go", "doesn't load", "didn't load",
     "doesn't appear", "didn't appear", "doesn't reflect", "didn't reflect",
     'wont work', 'wont go', 'wont send', 'wont load', 'wont let',
     'wont open', 'wont connect', 'wont show',
     "won't", "can't", 'cant', 'unable', 'cannot',
-    # Time waiting
     'still pending', 'still waiting', 'still not', 'still no',
     'never arrived', 'never got', 'never received', 'never showed',
     'been waiting', 'waited', 'hours ago', 'days ago', 'minutes ago',
     'since yesterday', 'since last', 'since this morning', 'since last night',
     'since monday', 'since tuesday', 'since wednesday', 'since thursday',
     'since friday', 'since saturday', 'since sunday',
-    # Missing
     'missing', 'disappeared', 'gone', 'vanished', 'not there', 'deducted',
     'wrong amount', 'wrong balance', 'short', 'less than',
-    # Error words
     'error', 'rejected', 'reverted', 'invalid', 'execution reverted',
     'deadline exceeded', 'nonce', 'insufficient', 'gas fee',
     'failed transaction', 'failed swap', 'failed withdrawal',
-    # Issue words
     'issue', 'problem', 'trouble', 'complain', 'complaint', 'bug',
     'broken', 'down', 'offline', 'not available', 'unavailable',
-    # Help seeking
     'lost', 'no response', 'no reply', 'please help', 'help me',
     'how do i fix', 'how to fix', 'fix this', 'please fix',
     'trying to', 'tried to', 'keep trying',
-    # Negative outcomes
     'blacklisted', 'scammed', 'rugged', 'rekt', 'liquidated',
     'got hit', 'front run', 'sandwiched', 'hacked', 'drained',
-    # Wallet
     'wrong network', 'wrong chain', 'switch network',
-    # Question-based complaints
-    'why is my', 'why did my', "why can't i", "why cant i", 'why isn't my',
+    'why is my', 'why did my', "why can't i", 'why cant i',
     'what happened to my', 'where is my', 'where are my',
     'how long does', 'how long will', 'when will my', 'when will it',
     'is this normal', 'is this supposed', 'should it take',
 }
+
+_FINANCIAL_RE = re.compile(
+    r"\b(swap|withdraw|deposit|transfer|wallet|transaction|tx|token|balance"
+    r"|fund|stake|bridge|app|platform|exchange|coin|crypto)\b",
+    re.I
+)
+_NOT_VERB_RE = re.compile(
+    r"\b(not\s+work\w*|not\s+load\w*|not\s+open\w*|broken|down|offline|not\s+respond\w*)\b",
+    re.I
+)
 
 def is_high_priority(cats: list, text: str) -> bool:
     t = text.lower()
@@ -348,16 +347,12 @@ def is_high_priority(cats: list, text: str) -> bool:
     if _STRONG_RE.search(text):
         return True
 
-    # First-person + any problem word — covers "I have an issue", "my tx failed", etc.
+    # First-person + any problem word
     if _FIRST_PERSON_RE.search(t) and any(p in t for p in _PROBLEM_WORDS):
         return True
 
-    # Standalone "not working / not loading" on anything financial
-    _FINANCIAL = re.compile(
-        r"\b(swap|withdraw|deposit|transfer|wallet|transaction|tx|token|balance|fund|stake|bridge|app|platform|exchange)\b",
-        re.I)
-    _NOT_VERB   = re.compile(r"\b(not\s+work\w*|not\s+load\w*|not\s+open\w*|broken|down|offline)\b", re.I)
-    if _FINANCIAL.search(text) and _NOT_VERB.search(text):
+    # Financial keyword + "not working/loading/broken" standalone
+    if _FINANCIAL_RE.search(text) and _NOT_VERB_RE.search(text):
         return True
 
     return False
