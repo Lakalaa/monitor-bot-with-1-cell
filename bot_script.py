@@ -110,37 +110,67 @@ _AD_PATTERNS = [
     # P2P exchange rate ads e.g. "1 USDT = 125 INR"
     r'1\s*(usdt|btc|eth|bnb|sol)\s*=\s*[\d,.\-~]+\s*(inr|pkr|ngn|php|vnd|bdt|cny|try|rub|aed|sar|egp|idr)',
     r'(usdt|btc|eth)\s*=\s*[\d,]+\s*(rupee|inr|naira|peso|yuan)',
-    # P2P fund category names
     r'\b(hack\s*fund|mixed\s*fund|stock\s*fund|cdm)\b',
-    # Buyer/seller solicitation
-    r'(need|looking\s+for|want).{0,30}(customer|buyer|seller|trader)',
     r'(large|high|huge|big)\s+(daily\s+)?(demand|supply|volume)\s+for\s+(usdt|btc|crypto)',
-    r'daily\s+(demand|supply|volume|rate)\s+for',
-    # Complaint period / P2P terms
     r'complaint\s+period',
     r'(usdt|btc|eth)\s+(buyer|seller|trader|needed)',
-    r'(buy|sell|exchange)\s+(usdt|btc|eth|crypto)\s+at\s+[\d,]+',
-    # Price list format (multiple lines with = or :)
-    r'([\d,]+\s*(inr|pkr|ngn|php|vnd).+\n){2,}',
+    # Token/project promotion
+    r'\$([\w]+)\s+(is|will|just|now|has)\s+(launch|moon|pump|list|explode|rally)',
+    r'(just\s+launched|just\s+listed|new\s+listing|newly\s+listed)',
+    r'(ido|ico|ieo|presale|pre-sale)\s+(live|open|starts?|launching|now)',
+    r'(token|coin)\s+(sale|launch|drop)\s+(is\s+)?(live|open|now|today)',
+    r'(nft|mint)\s+(is\s+)?(live|open|now|free|drop)',
+    r'early\s+(access|investor|bird|supporter)',
+    # Referral / affiliate spam
+    r'(use|join\s+with|sign\s+up\s+with)\s+my\s+(ref|referral|code|link|invite)',
+    r'referral\s+(code|link|bonus|reward)',
+    r'invite\s+(code|link|friends)',
+    r'(earn|get)\s+\d+%\s+(commission|bonus|reward)',
+    # Channel / group / website promotion
+    r'join\s+(our|my)\s+(channel|group|community|server)',
+    r'follow\s+(our|my|us)\s+(channel|page|account)',
+    r'(check\s+out|visit)\s+(our|my)\s+(website|site|channel|group)',
+    r'(telegram|discord|twitter)\s*[:]\s*@?\w+\s*(for\s+more|updates|signals)',
+    # Airdrop announcements
+    r'(airdrop|air\s*drop)\s+(is\s+)?(live|open|now|free|going)',
+    r'(free|get|earn)\s+\d+\s*(usdt|btc|eth|token)',
+    # Job / service ads  
+    r'(hiring|we\s+are\s+hiring|looking\s+for\s+(developers?|designers?|marketers?))',
+    r'(crypto|blockchain)\s+(developer|designer|marketer)\s+(available|for\s+hire)',
+    r'(professional|expert)\s+(trader|analyst|signals?)\s+(here|available)',
+    # Project announcements (not issues)
+    r'(we\s+are\s+)?(proud\s+to\s+)?announce',
+    r'(partnership|collaboration)\s+with',
+    r'(ama|ask\s+me\s+anything)\s+(session|live|today|now)',
+    r'(whitepaper|roadmap|tokenomics)\s+(released|updated|published|out)',
 ]
 _AD_RE = [re.compile(p, re.I | re.S) for p in _AD_PATTERNS]
 
+_AD_WORDS = {
+    'presale open', 'whitelist open', 'pump incoming', 'to the moon',
+    'gem alert', 'buy now', 'listing soon', '100x potential',
+    'financial advice', 'not financial advice', 'dyor', 'nfa',
+    'signal group', 'vip signals', 'copy trading', 'managed account',
+}
+
 def is_advertisement(text: str) -> bool:
-    # Pattern match
+    t = text.lower()
+    if any(w in t for w in _AD_WORDS):
+        return True
     if any(r.search(text) for r in _AD_RE):
         return True
-    # Repeated-line spam (same line 2+ times = bulk ad copy-paste)
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    # Repeated-line spam (same non-trivial line 2+ times = ad copy-paste)
+    lines = [l.strip() for l in text.split('\n') if len(l.strip()) > 10]
     if len(lines) >= 4:
         counts = {}
         for l in lines:
             counts[l] = counts.get(l, 0) + 1
         if max(counts.values()) >= 2:
             return True
-    # High emoji density with price-like numbers = promotional
+    # Emoji-heavy + prices = promotional blast
     emoji_count = sum(1 for c in text if ord(c) > 0x2600)
     digits      = sum(1 for c in text if c.isdigit())
-    if emoji_count >= 4 and digits >= 6 and len(lines) >= 4:
+    if emoji_count >= 5 and digits >= 6 and len(lines) >= 3:
         return True
     return False
 
@@ -154,41 +184,25 @@ _FIRST_PERSON_RE = re.compile(r"\b(i|my|me|mine|i've|i'm|i'd|i'll|ive|im)\b", re
 def is_high_priority(cats: list, text: str) -> bool:
     t = text.lower()
 
-    # Must contain first-person language — filters out general chat, observations, discussions
+    # Must have first-person language — no first person = not a personal report
     if not _FIRST_PERSON_RE.search(t):
         return False
 
-    # What the user personally owns or did (personal subject)
-    personal = [
-        'my transaction', 'my transfer', 'my swap', 'my withdrawal', 'my deposit',
-        'my funds', 'my tokens', 'my balance', 'my wallet', 'my coins', 'my money',
-        'my account', 'my address', 'my order',
-        'i sent', 'i transferred', 'i swapped', 'i deposited', 'i withdrew',
-        "i've sent", "i've been waiting", "i've lost", "i've tried",
-        "i can't", "i cannot", "i couldn't",
-        "i'm getting", "i'm stuck", "i'm unable", "i'm missing",
-        "i didn't receive", "i haven't received", "i haven't gotten",
-        'i lost', 'lost my',
-    ]
-
-    # What went wrong (problem context)
+    # Something must have gone wrong — any problem word + first person = real issue
     problem = [
-        'stuck', 'failed', 'not received', 'not arrived', 'not showing',
+        'stuck', 'failed', 'fail', 'not received', 'not arrived', 'not showing',
         'not confirmed', 'not credited', 'not reflected', 'not working',
-        'missing', 'disappeared', 'gone', 'lost', 'wrong amount',
-        'still pending', 'still waiting', 'never arrived', 'never showed',
+        'missing', 'disappeared', 'wrong amount', 'short',
+        'still pending', 'still waiting', 'still not', 'never arrived', 'never got',
         'hours ago', 'days ago', 'since yesterday', 'since last',
-        'error', 'rejected', 'reverted', 'invalid',
+        'error', 'rejected', 'reverted', 'invalid', 'issue', 'problem',
         "can't withdraw", 'cant withdraw', 'withdraw failed', 'withdrawal failed',
-        'swap failed', 'transfer failed', 'transaction failed',
-        'not letting', 'wont let', "won't let",
+        'swap failed', 'transfer failed', 'transaction failed', 'tx failed',
+        'not letting', 'wont let', "won't", 'unable', 'cannot', "can't",
+        'lost', 'no response', 'support', 'help',
     ]
 
-    has_personal = any(p in t for p in personal)
-    has_problem  = any(p in t for p in problem)
-
-    # Both required — "my transaction" alone isn't an issue; "failed" alone isn't personal
-    return has_personal and has_problem
+    return any(p in t for p in problem)
 
 def _now():
     return datetime.utcnow().strftime('%Y-%m-%d %H:%M')
@@ -807,6 +821,7 @@ def _start_userbot():
 
         async def scan_dialogs():
             try:
+                from telethon.tl.types import ChannelParticipantsAdmins
                 async for dlg in client.iter_dialogs():
                     ent = dlg.entity
                     if not isinstance(ent, (Chat, Channel)):
@@ -816,13 +831,19 @@ def _start_userbot():
                     uname = getattr(ent, 'username', None) or ''
                     if cid not in known:
                         known[cid] = title
-                        # Register silently — no notification for existing groups
                         joined_groups.setdefault(cid, {
                             'title': title, 'chat_id': cid,
                             'chat_username': uname, 'session_num': num,
                             'joined_at': _now(), 'msg_count': 0,
                         })
-                        await asyncio.sleep(0.2)
+                        # Pre-warm admin cache so first message needs no API call
+                        try:
+                            admins = await client.get_participants(
+                                ent, filter=ChannelParticipantsAdmins())
+                            _admin_cache[cid] = (frozenset(u.id for u in admins), time.time())
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.5)
             except Exception as e:
                 logger.warning('UB #%d scan error: %s', num, e)
 
