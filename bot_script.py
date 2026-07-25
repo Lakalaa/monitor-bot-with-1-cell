@@ -104,6 +104,45 @@ def is_scam(text: str) -> bool:
         return True
     return any(r.search(text) for r in SCAM_RE)
 
+# ── Advertisement / marketing detector ────────────────────────────────────────
+_AD_PATTERNS = [
+    # P2P exchange rate ads e.g. "1 USDT = 125 INR"
+    r'1\s*(usdt|btc|eth|bnb|sol)\s*=\s*[\d,.\-~]+\s*(inr|pkr|ngn|php|vnd|bdt|cny|try|rub|aed|sar|egp|idr)',
+    r'(usdt|btc|eth)\s*=\s*[\d,]+\s*(rupee|inr|naira|peso|yuan)',
+    # P2P fund category names
+    r'\b(hack\s*fund|mixed\s*fund|stock\s*fund|cdm)\b',
+    # Buyer/seller solicitation
+    r'(need|looking\s+for|want).{0,30}(customer|buyer|seller|trader)',
+    r'(large|high|huge|big)\s+(daily\s+)?(demand|supply|volume)\s+for\s+(usdt|btc|crypto)',
+    r'daily\s+(demand|supply|volume|rate)\s+for',
+    # Complaint period / P2P terms
+    r'complaint\s+period',
+    r'(usdt|btc|eth)\s+(buyer|seller|trader|needed)',
+    r'(buy|sell|exchange)\s+(usdt|btc|eth|crypto)\s+at\s+[\d,]+',
+    # Price list format (multiple lines with = or :)
+    r'([\d,]+\s*(inr|pkr|ngn|php|vnd).+\n){2,}',
+]
+_AD_RE = [re.compile(p, re.I | re.S) for p in _AD_PATTERNS]
+
+def is_advertisement(text: str) -> bool:
+    # Pattern match
+    if any(r.search(text) for r in _AD_RE):
+        return True
+    # Repeated-line spam (same line 2+ times = bulk ad copy-paste)
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    if len(lines) >= 4:
+        counts = {}
+        for l in lines:
+            counts[l] = counts.get(l, 0) + 1
+        if max(counts.values()) >= 2:
+            return True
+    # High emoji density with price-like numbers = promotional
+    emoji_count = sum(1 for c in text if ord(c) > 0x2600)
+    digits      = sum(1 for c in text if c.isdigit())
+    if emoji_count >= 4 and digits >= 6 and len(lines) >= 4:
+        return True
+    return False
+
 def categorize(text: str) -> list:
     t = text.lower()
     matched = [cat for cat, kws in CATEGORIES.items() if any(kw in t for kw in kws)]
@@ -214,8 +253,8 @@ def capture(msg: dict, session_num: int = 0, msg_id: int = None):
     if dedup_key in _seen_msgs:
         return
     _seen_msgs.append(dedup_key)
-    # Scam filter
-    if is_scam(text):
+    # Scam and advertisement filter
+    if is_scam(text) or is_advertisement(text):
         return
 
     cats     = categorize(text)
@@ -800,11 +839,24 @@ def _start_userbot():
                     return
                 # Skip admins, moderators, creators — only alert on regular users
                 try:
-                    perms = await client.get_permissions(chat, sender)
-                    if perms and (perms.is_admin or perms.is_creator):
+                    from telethon.tl.types import (
+                        ChannelParticipantAdmin, ChannelParticipantCreator,
+                        ChatParticipantAdmin, ChatParticipantCreator,
+                    )
+                    participant = await client.get_participant(chat, sender)
+                    if isinstance(participant, (
+                        ChannelParticipantAdmin, ChannelParticipantCreator,
+                        ChatParticipantAdmin, ChatParticipantCreator,
+                    )):
                         return
                 except Exception:
-                    pass  # Can't check perms — allow through
+                    # Fallback: try get_permissions
+                    try:
+                        perms = await client.get_permissions(chat, sender)
+                        if perms and (perms.is_admin or perms.is_creator):
+                            return
+                    except Exception:
+                        pass
                 text = (event.message.text or event.message.message or '').strip()
                 if not text:
                     return
