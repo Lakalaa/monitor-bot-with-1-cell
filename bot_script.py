@@ -440,17 +440,15 @@ def capture(msg: dict, session_num: int = 0, msg_id: int = None):
     if cid and cid in joined_groups:
         joined_groups[cid]['msg_count'] += 1
 
-    priority = is_high_priority(cats, text)
     entry = {
         'time': _now(), 'user_id': user.get('id'),
         'username': uname, 'project': project,
         'chat_username': chat_usr, 'session_num': session_num,
-        'text': text, 'cats': cats, 'priority': priority,
+        'text': text, 'cats': cats, 'priority': True,
     }
     message_log.append(entry)
-    if priority:
-        alert_log.append(entry)
-        notify_live(entry)
+    alert_log.append(entry)
+    notify_live(entry)
 
 # ── Render helpers ─────────────────────────────────────────────────────────────
 def render_get_env() -> list:
