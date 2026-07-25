@@ -1093,6 +1093,7 @@ def _start_userbot():
             flood_sleep_threshold=60, request_retries=5,
             connection_retries=-1, retry_delay=5,
             auto_reconnect=True, receive_updates=True,
+            catch_up=True,
         )
         known: dict = {}
 
@@ -1198,6 +1199,22 @@ def _start_userbot():
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 120)  # cap at 2 min
 
+    async def keep_alive():
+        """Ping our own URL every 8 min so Render never idles the service."""
+        import urllib.request as _ur
+        url = os.environ.get('WEBHOOK_URL', '').rstrip('/')
+        if not url:
+            logger.info('keep_alive: WEBHOOK_URL not set, skipping')
+            return
+        ping_url = url + '/'
+        while True:
+            await asyncio.sleep(480)   # 8 minutes
+            try:
+                _ur.urlopen(ping_url, timeout=10).read()
+                logger.info('keep_alive: ping ok')
+            except Exception as e:
+                logger.warning('keep_alive: ping failed: %s', e)
+
     async def ub_main():
         ub_sessions = get_ub_sessions()
         while not ub_sessions:
@@ -1205,7 +1222,10 @@ def _start_userbot():
             await asyncio.sleep(30)
             ub_sessions = get_ub_sessions()
         logger.info('UB: starting %d session(s)', len(ub_sessions))
-        await asyncio.gather(*[run_one_forever(n, s) for n, s in ub_sessions])
+        await asyncio.gather(
+            keep_alive(),
+            *[run_one_forever(n, s) for n, s in ub_sessions]
+        )
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
