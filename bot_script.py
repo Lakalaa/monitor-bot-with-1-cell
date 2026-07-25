@@ -377,15 +377,17 @@ def send(chat_id, text, parse_mode='HTML'):
 def notify_live(entry: dict):
     if not NOTIFY_CHAT_ID:
         return
-    grp     = entry['project']
-    gusr    = entry.get('chat_username', '')
+    grp      = entry['project']
+    gusr     = entry.get('chat_username', '')
     grp_link = f'<a href="https://t.me/{gusr}">{grp}</a>' if gusr else f'<b>{grp}</b>'
-    uname   = entry['username']
+    uname    = entry['username']
     user_str = f'@{uname}' if uname else 'Unknown'
-    text    = entry['text'][:600]
+    acct_num = entry.get('session_num', '?')
+    text     = entry['text'][:600]
     tg('sendMessage', chat_id=NOTIFY_CHAT_ID, parse_mode='HTML',
        disable_web_page_preview=True,
        text=(f'🚨 <b>USER ISSUE</b>\n'
+             f'🔢 <b>Account #{acct_num}</b>\n'
              f'📁 {grp_link}\n'
              f'👤 <b>{user_str}</b>\n\n'
              f'💬 {text}'))
@@ -440,15 +442,17 @@ def capture(msg: dict, session_num: int = 0, msg_id: int = None):
     if cid and cid in joined_groups:
         joined_groups[cid]['msg_count'] += 1
 
+    priority = is_high_priority(cats, text)
     entry = {
         'time': _now(), 'user_id': user.get('id'),
         'username': uname, 'project': project,
         'chat_username': chat_usr, 'session_num': session_num,
-        'text': text, 'cats': cats, 'priority': True,
+        'text': text, 'cats': cats, 'priority': priority,
     }
     message_log.append(entry)
-    alert_log.append(entry)
-    notify_live(entry)
+    if priority:
+        alert_log.append(entry)
+        notify_live(entry)
 
 # ── Render helpers ─────────────────────────────────────────────────────────────
 def render_get_env() -> list:
