@@ -225,99 +225,102 @@ def categorize(text: str) -> list:
     matched = [cat for cat, kws in CATEGORIES.items() if any(kw in t for kw in kws)]
     return matched if matched else ['general']
 
-# ── Strict two-signal filter ──────────────────────────────────────────────────
-# A message is only forwarded if it has BOTH:
-#   (A) a crypto/financial action word  AND
-#   (B) a clear problem signal
-# OR matches an unambiguous hardcoded pattern.
-# This eliminates greetings, opinions, market talk, random chat.
+# ── Message filter ────────────────────────────────────────────────────────────
+# Tier 1 (_EXPLICIT_ISSUE_RE): crystal-clear issue patterns — forward always.
+# Tier 2: first-person ("my", "I") + specific action word + specific problem.
+# Everything else is blocked.
+# Per-group cap: max 3 alerts per group per 60 min (stops one group flooding).
 
-_FINANCIAL_ACTION_RE = re.compile(
+_FIRST_PERSON_RE = re.compile(
+    r"\b(my|i'?ve|i'?m|i'?d|i'?ll|i\b|mine|we\b|our\b|ive\b|im\b)\b", re.I
+)
+
+# Specific action words only — removed broad terms (coin, crypto, exchange, trade, nft, pool, dex, defi)
+_ACTION_WORD_RE = re.compile(
     r'\b(swap(ping|ped)?|transfer(red|ring)?|withdraw(al|ing|n|s)?'
-    r'|deposit(ed|ing|s)?|transaction(s)?|tx\b'
-    r'|buy(ing)?|sell(ing)?|sold\b|bought\b'
+    r'|deposit(ed|ing|s)?|transaction(s)?|\btx\b'
     r'|stak(e|ing|ed)|unstake?|unstaking'
     r'|bridge(d|ing)?|claim(ed|ing|s)?'
-    r'|send(ing)?|sent\b|receiv(e|ed|ing)'
-    r'|wallet|balance|funds?|tokens?|coins?'
-    r'|crypto|exchange|trad(e|ing|ed)'
+    r'|sent\b|send(ing)?|receiv(e|ed|ing)'
+    r'|wallet|balance|funds?|token(s)?\b'
     r'|liquidity|gas\s*fee|approve(d)?'
     r'|mint(ed|ing)?|airdrop|payment(s)?'
-    r'|nft|defi|dex|pool|staking\s+reward)\b',
+    r'|staking\s+reward|buy\s+order|sell\s+order)\b',
     re.I
 )
 
+# Specific problem signals only — removed broad terms (issue, problem, bug, broken, help me)
 _PROBLEM_SIGNAL_RE = re.compile(
     r'\bfail(ed|ing|s|ure)?\b'
     r'|\bstuck\b'
     r'|\berror\b'
     r'|\brevert(ed|ing)?\b'
     r'|\brejected\b'
-    r'|\bpending\b.*\b(long|hours?|days?|still|forever)\b'
     r'|\bnot\s+(receiv\w+|showing|working|loading|credited|confirmed|arrived|reflected|going\s+through|completing)\b'
     r"|\bisn'?t\s+(showing|working|loading|confirmed|credited|reflecting)\b"
-    r"|\baren'?t\s+(showing|working|loading)\b"
     r'|\bmissing\b'
     r'|\bdisappear\w*\b'
     r'|\bvanish\w*\b'
-    r'|\b(funds?|tokens?|balance|money|coins?)\s+(gone|lost)\b'
-    r"|\bcan'?t\b"
-    r'|\bcannot\b'
-    r'|\bunable\s+to\b'
-    r"|\bwon'?t\b"
-    r"|\bdoesn'?t\s+work\b"
+    r"|\bcan'?t\b|\bcannot\b|\bunable\s+to\b|\bwon'?t\b"
     r'|\bstill\s+(no|not|pending|stuck|waiting|unconfirmed)\b'
     r'|\bnever\s+(receiv\w+|arrived?|show\w*|confirmed|got)\b'
     r'|\bwrong\s+(amount|network|chain|address)\b'
-    r'|\binsufficient\b'
-    r'|\bdeducted\b'
-    r'|\bblacklist\w*\b'
-    r'|\bscammed?\b'
-    r'|\brugged?\b'
-    r'|\bhacked?\b'
-    r'|\bdrained?\b'
-    r'|\b(help\s+me|please\s+help|pls\s+help|need\s+help)\b'
-    r'|\b(issue|problem|bug)\b'
-    r'|\bbroken\b'
-    r'|\bwaited?\s+\d+\b'
-    r'|\bwaiting\s+(for\s+)?\d+\b'
-    r'|\bwhere\s+is\s+my\b'
-    r'|\bwhat\s+happened\s+to\s+my\b'
-    r'|\b\d+\s*(hours?|days?|hrs?)\s+(and|but|yet)?\s*still\b'
-    r'|\bsince\s+(yesterday|last\s+\w+|\d+\s*(hour|day|hr))',
+    r'|\binsufficient\b|\bdeducted\b|\bblacklist\w*\b'
+    r'|\bscammed?\b|\brugged?\b|\bhacked?\b|\bdrained?\b'
+    r'|\bwaited?\s+\d+\b|\bwaiting\s+(for\s+)?\d+\b'
+    r'|\bwhere\s+is\s+my\b|\bwhat\s+happened\s+to\s+my\b'
+    r'|\b\d+\s*(hours?|days?|hrs?)\s+(and\s+)?(but\s+)?still\b'
+    r'|\bsince\s+(yesterday|last\s+\w+|\d+\s*(hour|day|hr))\b'
+    r'|\bpending\s+(for\s+)?(hours?|days?|\d+)\b',
     re.I | re.S
 )
 
-# Unambiguous standalone patterns — forward without needing both signals
+# Crystal-clear issue patterns — no first-person required
 _EXPLICIT_ISSUE_RE = re.compile(
     r"\bcan'?t\s+(sell|buy|swap|withdraw|transfer|connect|access|stake|bridge|unstake|claim|log\s*in|sign\s*in)\b"
     r"|\bcannot\s+(sell|buy|swap|withdraw|transfer|connect|access|stake|bridge|claim)\b"
-    r"|\bunable\s+to\s+(swap|withdraw|transfer|stake|bridge|claim|sell|buy)\b"
-    r'|\b(swap|transfer|withdraw|deposit|transaction|tx|bridge|stake|claim)\s+(fail(ed|ing)?|stuck|revert(ed)?|rejected)\b'
+    r"|\bunable\s+to\s+(swap|withdraw|transfer|stake|bridge|claim|sell|buy|connect)\b"
+    r'|\b(swap|transfer|withdraw|deposit|transaction|tx|bridge|stake|claim)\s+(fail(ed|ing)?|stuck|revert(ed)?|rejected|error)\b'
     r'|\bexecution\s+reverted\b'
     r'|\binsufficient\s+(funds?|balance|gas|liquidity)\b'
     r'|\b(funds?|tokens?|balance|deposit|withdrawal|money)\s+(gone|missing|lost|not\s+show\w*|not\s+receiv\w*|not\s+credit\w*|deducted)\b'
-    r'|\bwhere\s+(is|are)\s+(my|the)\s+(funds?|tokens?|balance|money|deposit|withdrawal)\b'
+    r'|\bwhere\s+(is|are)\s+my\s+(funds?|tokens?|balance|money|deposit|withdrawal)\b'
     r'|\bwhat\s+happened\s+to\s+my\s+(funds?|tokens?|balance|money|deposit)\b'
     r'|\b(deducted|charged)\s+(but|and)\s+(not|never)\s+(receiv\w+|credited|arrived|showing)\b'
     r'|\bwallet\s+(not|won\'?t|can\'?t)\s+(connect\w*|load\w*|work\w*|sign\w*)\b'
-    r'|\b(got|been|was)\s+(scammed?|rugged?|hacked?|drained?|blacklisted)\b'
+    r'|\b(got|been|was|i\'?ve\s+been)\s+(scammed?|rugged?|hacked?|drained?|blacklisted)\b'
     r'|\b(rug\s*pull|rugpull|exit\s+scam)\b'
-    r'|\banyone\s+(else\s+)?(hav|experienc|getting|having|seeing|facing)\b'
+    r'|\banyone\s+(else\s+)?(having|experiencing|getting|facing)\s+\w[\w\s]{0,30}?(issue|problem|error|bug|trouble)\b'
     r'|\bsame\s+(issue|problem|error|bug)\s+here\b'
     r'|\bstill\s+(pending|stuck)\s+(for|since)\s+\d+\b'
-    r'|\b\d+\s*(hours?|days?)\s+(and|but)\s+still\b'
-    r'|\b(waited?|waiting)\s+(for\s+)?\d+\s*(hours?|days?|hrs?|mins?)\b',
+    r'|\b\d+\s*(hours?|days?)\s+(and\s+|but\s+)?still\s+(not|pending|stuck|nothing)\b'
+    r'|\b(waited?|waiting)\s+(for\s+)?\d+\s*(hours?|days?|hrs?|mins?)\b'
+    r'|\bmy\s+(swap|transfer|withdraw\w*|deposit|tx|transaction|stake|bridge|claim)\s+(fail\w*|stuck|revert\w*|rejected)\b',
     re.I | re.S
 )
 
+# Per-group alert rate limit: max 3 per group per 60 minutes
+_group_alert_times: dict = {}
+
+def _group_rate_ok(chat_id) -> bool:
+    now = time.time()
+    cutoff = now - 3600
+    times = [t for t in _group_alert_times.get(chat_id, []) if t > cutoff]
+    if len(times) >= 3:
+        return False
+    times.append(now)
+    _group_alert_times[chat_id] = times
+    return True
+
 def is_high_priority(cats: list, text: str) -> bool:
-    # Unambiguous explicit issue — forward immediately
+    # Tier 1: crystal-clear explicit issue pattern
     if _EXPLICIT_ISSUE_RE.search(text):
         return True
 
-    # Requires BOTH a financial/action term AND a problem signal
-    if _FINANCIAL_ACTION_RE.search(text) and _PROBLEM_SIGNAL_RE.search(text):
+    # Tier 2: must be personal (first-person) + specific action + specific problem
+    if (_FIRST_PERSON_RE.search(text)
+            and _ACTION_WORD_RE.search(text)
+            and _PROBLEM_SIGNAL_RE.search(text)):
         return True
 
     return False
@@ -416,7 +419,7 @@ def capture(msg: dict, session_num: int = 0, msg_id: int = None):
         'text': text, 'cats': cats, 'priority': priority,
     }
     message_log.append(entry)
-    if priority:
+    if priority and _group_rate_ok(cid):
         alert_log.append(entry)
         notify_live(entry)
 
